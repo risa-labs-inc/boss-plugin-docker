@@ -1,0 +1,32 @@
+{
+  "manifestVersion": 1,
+  "pluginId": "ai.rever.boss.plugin.dynamic.docker",
+  "displayName": "Docker",
+  "version": "1.0.0",
+  "apiVersion": "1.0.48",
+  "minApiVersion": "1.0.48",
+  "minBossVersion": "9.2.35",
+  "mainClass": "ai.rever.boss.plugin.dynamic.docker.DockerDynamicPlugin",
+  "type": "mixed",
+  "description": "Manage local Docker from the sidebar — containers, images, volumes, networks, and the current project's Dockerfiles and compose files. Builds stream to a terminal tab; running services open a tab with live logs and a preview of what they serve.",
+  "author": "Risa Labs",
+  "url": "https://github.com/risa-labs-inc/boss-plugin-docker",
+  "panel": {
+    "icon": "Inventory2",
+    "location": "left.bottom",
+    "order": 55,
+    "panelId": "docker-panel",
+    "displayName": "Docker"
+  },
+  "definedPermissions": [
+    {
+      "name": "docker.manage",
+      "description": "Stop and remove Docker containers, images, volumes and networks"
+    }
+  ],
+  "sandbox": {
+    "maxThreads": 8,
+    "maxRestartAttempts": 3,
+    "heartbeatIntervalMs": 5000
+  }
+}
