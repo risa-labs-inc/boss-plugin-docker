@@ -160,7 +160,6 @@ class DockerServices(val context: PluginContext) {
     }
 }
 
-
 /** What [DockerServices.openServiceTabVerified] observed. */
 enum class TabOpenOutcome {
     /** A tab with this id already existed and was focused. */

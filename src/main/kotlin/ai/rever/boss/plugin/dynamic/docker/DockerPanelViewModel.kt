@@ -134,9 +134,11 @@ class DockerPanelViewModel(private val services: DockerServices) {
             // Names the shared tab on purpose. Two Run clicks in a row do not build in
             // parallel any more — the second stops the first — so a bare "Building A"
             // followed by "Building B" would leave the operator believing both are alive.
+            // Short enough not to be truncated, with the load-bearing half first: that
+            // this shares one terminal, so a later build or compose command stops it.
             services.toastInfo(
-                "Building ${request.artifact.suggestedName} → localhost:$host in the docker terminal " +
-                    "(a later build or compose command stops it)",
+                "Building ${request.artifact.suggestedName} in the shared docker terminal " +
+                    "→ localhost:$host",
             )
         }
     }

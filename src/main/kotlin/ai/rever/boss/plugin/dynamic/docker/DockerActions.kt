@@ -9,8 +9,9 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
-import java.util.concurrent.atomic.AtomicInteger
 import java.net.ServerSocket
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /** Where a launched terminal tab should be placed. */
 enum class OpenLocation { NEW_TAB, SPLIT_RIGHT, SPLIT_DOWN }
@@ -66,16 +67,16 @@ class DockerActions(private val services: DockerServices) {
      * ConcurrentModificationException waiting for the right timing — pre-existing, but
      * this change is explicitly about getting this file's threading right.
      */
-    private val pendingAutoOpen = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val pendingAutoOpen = ConcurrentHashMap<String, Long>()
 
     /**
      * The terminal tab this plugin owns.
      *
-     * Written **only** by [runTerminalCommands], of which there is exactly one, so no
-     * atomicity is needed. `ownedTerminal` is `@Volatile` because [runInExistingTerminal]
-     * reads it from the caller's thread on the accept path; a stale `null` there only
-     * costs one command a BOSS tab it could have shared, and the consumer re-validates
-     * through [liveOwnedTerminal] regardless.
+     * Confined to the consumer: [runTerminalCommands] is the only reader and writer, and
+     * there is exactly one of it, so no atomicity or visibility is needed today. (The
+     * accept path used to read it too; that went away when it stopped inspecting
+     * anything.) `@Volatile` is kept as belt-and-braces in case a caller-side read is
+     * ever reintroduced — not because one exists.
      *
      * Kept here rather than on [DockerServices] so that guarantee is structural — a
      * public field on the shared services object is one any future call site can write
@@ -249,6 +250,12 @@ class DockerActions(private val services: DockerServices) {
      * Falls back to a new BOSS terminal tab when there is no live terminal to join at
      * all, or when the terminal-tab plugin isn't loaded. A terminal in this window is
      * preferred but not required — see [findTerminalHost].
+     *
+     * **Every `NEW_TAB` caller shares one tab and interrupts the others**, and the MCP
+     * tool text enumerates which commands those are ("another docker build or compose
+     * command"). That enumeration is only true because of which callers pass `NEW_TAB`
+     * — nothing checks it. Adding one (wiring up [runImage], say) falsifies three tool
+     * descriptions and a panel toast, so update them together.
      */
     fun openTerminal(
         id: String,
@@ -356,10 +363,12 @@ class DockerActions(private val services: DockerServices) {
         val api = services.context.getPluginAPI(TerminalTabPluginAPI::class.java)
         val tabs = services.context.activeTabsProvider?.activeTabs?.value
         if (api == null || tabs == null) {
-            // Said out loud rather than swallowed: on a host where the terminal-tab
-            // plugin simply isn't loaded, this degrades to a BOSS tab per command — the
-            // clutter this path exists to remove — with nothing to explain why.
-            log("No terminal-tab API; opening a BOSS tab for: ${queued.command}")
+            // Said out loud rather than swallowed: this degrades to a BOSS tab per
+            // command — the clutter this path exists to remove — so the reason needs to
+            // be findable. Both causes are real: terminal-tab not loaded, or a host that
+            // supplies no activeTabsProvider. The message names which.
+            val missing = if (api == null) "terminal-tab API" else "activeTabsProvider"
+            log("No $missing; opening a BOSS tab for: ${queued.command}")
             fallBackToBossTab(queued)
             return
         }
@@ -469,30 +478,53 @@ class DockerActions(private val services: DockerServices) {
         // sendCommand take no tabId, so both act on the terminal's *active* tab, and
         // without the switch a Ctrl-C could land on the user's own tab.
         //
+        // Re-asserted before *every* write, not once up front.
+        //
+        // sendInterrupt and sendCommand take no tabId — they hit the terminal's *active*
+        // tab — so the switch is what keeps them off the user's tab. Asserting it once
+        // and then sleeping 1.2 s would mean acting on a state verified before the sleep,
+        // and the active tab can change inside that window: the user clicking a sub-tab,
+        // made *more* likely because the plugin just pulled focus to the terminal
+        // mid-work. The consequence is the exact injection this design exists to prevent
+        // — a `docker build` typed into whatever they were running.
+        //
+        // There is no atomic switch-and-write in the API, so the window cannot be closed;
+        // this shrinks it from 1.2 s to the gap between two adjacent calls. It is free on
+        // the happy path because switchToTabById returns true when the tab is already
+        // active, and false only when the id is unknown — which is the correct bail-out.
+        //
         // Two things verified against BossTerm rather than assumed (compose-ui
         // TabController, as of bossterm-compose 1.2.129):
         //
-        // It is safe from this background thread because BossTerm resolves the target by
+        // Safe from this background thread because BossTerm resolves the target by
         // *reading state*, not by waiting for recomposition: `activeTabIndex` is
         // `by mutableStateOf`, so a write from any thread lands in the global snapshot at
         // once, and `activeTab` is a plain getter over it.
         //
-        // And a `false` here really does mean "no such tab": `switchToTabById` returns
-        // false only when the id is not found, and true when the tab is already active
-        // (the no-op early return is inside the index-based overload it delegates to). So
-        // treating false as fatal cannot misfire on the common already-focused case.
-        if (!runCatching { api.switchToTab(owned.windowId, owned.terminalId, owned.tabId) }.getOrDefault(false)) {
-            return false
-        }
+        // And `false` really does mean "no such tab": `switchToTabById` returns false only
+        // when the id is not found (the already-active no-op early return lives in the
+        // index-based overload it delegates to).
+        suspend fun focusOurTab(): Boolean =
+            runCatching { api.switchToTab(owned.windowId, owned.terminalId, owned.tabId) }
+                .getOrDefault(false)
+
+        if (!focusOurTab()) return false
         runCatching { api.sendInterrupt(owned.windowId, owned.terminalId) }
         delay(INTERRUPT_ESCALATE_MS)
+        if (!focusOurTab()) return false
         runCatching { api.sendInterrupt(owned.windowId, owned.terminalId) }
         delay(SHELL_REGAIN_LINE_MS)
+        if (!focusOurTab()) return false
         // A command already waiting means this one is superseded the moment it is typed:
         // the consumer returns as soon as sendCommand lands, so the next item's interrupt
-        // fires ~0 ms later and this gets no runway at all. The tool wording hedges for
-        // it ("if the build completes"), but silence in the terminal is confusing, so say
-        // it where someone debugging would look.
+        // fires ~0 ms later and this gets no runway at all.
+        //
+        // Logged rather than skipped, deliberately. Dropping looks like the obvious win
+        // and is not, because it is only safe for some commands: a superseded build or
+        // compose-up is genuinely redundant — the survivor supersedes it — but a
+        // superseded `compose down` would be a *destructive action silently skipped*,
+        // which is worse than a noisy one that at least starts. Acting on this needs that
+        // per-command distinction, not a blanket skip.
         if (pending.get() > 0) {
             log("Another command is already queued; this one will be interrupted almost immediately")
         }

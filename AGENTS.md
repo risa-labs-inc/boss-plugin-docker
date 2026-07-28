@@ -80,9 +80,10 @@ executes — and the sequence must be indivisible, or a second command's interru
 first has been typed and the first swallows it. A `synchronized` block that launches the send does
 **not** achieve that. One consumer also keeps this off the UI thread (panel clicks call
 `openTerminal` directly, and these are cross-plugin calls whose threading contract the plugin does
-not control). `ownedTerminal` is a `@Volatile private var` in `DockerActions` rather than a
-field on the shared services object — private so no call site can retarget the tab without
-queueing, volatile because the accept path reads it off the consumer's thread. Reusing one tab makes docker commands
+not control). `ownedTerminal` is a `private var` in `DockerActions` rather than a field on the shared services
+object, so no call site can retarget the tab without going through the queue. It is confined to
+the consumer — the only reader and writer — and the `@Volatile` on it is belt-and-braces for a
+caller-side read that no longer exists, not a live requirement. Reusing one tab makes docker commands
 mutually exclusive — a second build or compose command stops the first — and that is said
 **prospectively**, by the MCP tool descriptions and results and by the panel's own toast, not by a
 notification afterwards. There is no liveness signal to gate an after-the-fact toast on
