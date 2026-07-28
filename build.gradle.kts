@@ -49,8 +49,10 @@ dependencies {
     implementation(compose.material)
     implementation(compose.materialIconsExtended)
 
-    // Compose Icons (FeatherIcons)
+    // Compose Icons. Not bundled by buildPluginJar — the host provides these
+    // (composeApp depends on both), so they resolve via the classloader fallback.
     implementation("br.com.devsrsouza.compose.icons:feather:1.1.1")
+    implementation("br.com.devsrsouza.compose.icons:simple-icons:1.1.1")
 
     // Decompose for ComponentContext
     implementation("com.arkivanov.decompose:decompose:3.3.0")
