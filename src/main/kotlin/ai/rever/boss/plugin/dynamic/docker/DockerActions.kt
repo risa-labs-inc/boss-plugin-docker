@@ -53,7 +53,7 @@ class DockerActions(private val services: DockerServices) {
      * atomicity is needed. `ownedTerminal` is `@Volatile` because [runInExistingTerminal]
      * reads it from the caller's thread on the accept path; a stale `null` there only
      * costs one command a BOSS tab it could have shared, and the consumer re-validates
-     * through [liveOwnedTerminal] regardless. `lastSendAtMs` is consumer-only.
+     * through [liveOwnedTerminal] regardless.
      *
      * Kept here rather than on [DockerServices] so that guarantee is structural — a
      * public field on the shared services object is one any future call site can write
@@ -64,12 +64,6 @@ class DockerActions(private val services: DockerServices) {
     @Volatile
     private var ownedTerminal: CommandTerminal? = null
 
-    /** When the consumer last typed into the owned tab; 0 if it never has. */
-    private var lastSendAtMs = 0L
-
-    private fun markSent() {
-        lastSendAtMs = System.currentTimeMillis()
-    }
 
     /**
      * One command per send, drained in order by [runTerminalCommands].
@@ -314,12 +308,8 @@ class DockerActions(private val services: DockerServices) {
      * switch → interrupt → wait → type, and the wait is unavoidable: `sendCommand`
      * writes to the tab's pty, so while a foreground process is running the text goes
      * to *that process's stdin* — never queued, never run — and Ctrl-C is what makes
-     * the shell the reader again. Nothing may interleave with that sequence. An earlier
-     * attempt held a `synchronized` block across the interrupt but `launch`ed the send,
-     * which let a second command's interrupt land *before* the first command had been
-     * typed, so the first ran and the second was swallowed — the exact bug the
-     * interrupt exists to prevent, reintroduced one step later. Sequencing it through
-     * a channel makes the ordering structural rather than something the comments claim.
+     * the shell the reader again. Nothing may interleave with that sequence, and a lock
+     * cannot supply that when part of the sequence is a suspend.
      *
      * Running here also keeps all of it off the UI thread: panel clicks call
      * [openTerminal] directly, and this body makes cross-plugin calls whose threading
@@ -334,6 +324,10 @@ class DockerActions(private val services: DockerServices) {
             try {
                 deliver(queued)
             } catch (cancel: CancellationException) {
+                // Named for the same reason dispose() names what it drops: this command was
+                // already reported as launched, and it is the one most likely to matter,
+                // because it was mid-delivery rather than still queued.
+                System.err.println("[Docker] Cancelled mid-delivery: ${queued.command}")
                 throw cancel // plugin is being disposed; not a delivery failure
             } catch (t: Throwable) {
                 System.err.println("[Docker] Terminal delivery failed: $t")
@@ -359,9 +353,22 @@ class DockerActions(private val services: DockerServices) {
         val delivered = if (owned != null) {
             deliverToOwnedTab(api, owned, full)
         } else {
-            createOwnedTab(api, tabs, queued.command, queued.workingDir)
+            // `full`, not the bare command: both paths then derive the directory the same
+            // way. Relying on createTab's workingDirectory here instead would mean that if
+            // it is ever not honoured for the initial command, the *first* command runs in
+            // the wrong place and every later one is right — a miserable thing to debug.
+            // A redundant cd costs nothing.
+            createOwnedTab(api, tabs, full)
         }
-        if (!delivered) fallBackToBossTab(queued)
+        if (!delivered) {
+            // Forget the tab. `liveOwnedTerminal` only drops it when it is *gone*, so a tab
+            // that exists but refuses writes would otherwise stay owned forever: every later
+            // command would pay two Ctrl-Cs and 1.2 s, kill whatever is in it, and open a
+            // BOSS tab anyway — the clutter this exists to prevent, on a loop, in silence.
+            System.err.println("[Docker] Terminal refused the command; dropping the owned tab")
+            ownedTerminal = null
+            fallBackToBossTab(queued)
+        }
     }
 
     /**
@@ -455,26 +462,10 @@ class DockerActions(private val services: DockerServices) {
         delay(SHELL_REGAIN_LINE_MS)
         val sent = runCatching { api.sendCommand(owned.windowId, owned.terminalId, full) }.getOrDefault(false)
         if (sent) {
-            // Reported only once the send succeeded. Announcing the interrupt first meant
-            // a failed send killed whatever was running, said so, and *then* opened a
-            // BOSS tab anyway — the worst of both, and two notifications for one command.
-            //
             // Deliberately not phrased as "interrupting the previous command": nothing
             // tells us whether one was still running, and a toast that cries wolf every
             // time is the one that gets tuned out on the occasion it is reporting a real
             // two-minute build being killed.
-            // Only when something plausibly *was* running. `hasSentCommand` was useless
-            // as a guard: deliverToOwnedTab is reachable only once an owned tab exists,
-            // and creating one sets the flag — so it was always true and the toast fired
-            // on every single command, which is the cry-wolf case this is meant to avoid.
-            // Elapsed time is still a heuristic (nothing reports liveness —
-            // boss-plugins#11), but it goes quiet for the common shape: run something,
-            // read the output, run the next thing.
-            val since = System.currentTimeMillis() - lastSendAtMs
-            if (lastSendAtMs != 0L && since < INTERRUPT_WARN_WINDOW_MS) {
-                services.toastInfo("Reusing the docker terminal — anything still running there is stopped")
-            }
-            markSent()
             // Re-read rather than reusing the snapshot taken before ~1.2 s of delay:
             // focusing a tab that has since moved is benign but wrong, and this is free.
             focusHostTab(owned.terminalId, owned.windowId)
@@ -487,23 +478,19 @@ class DockerActions(private val services: DockerServices) {
         api: TerminalTabPluginAPI,
         tabs: List<ActiveTabData>,
         command: String,
-        dir: String?,
     ): Boolean {
         val host = findTerminalHost(api, tabs) ?: return false
         val newTabId = runCatching {
             api.createTab(
                 windowId = host.windowId,
                 terminalId = host.tabId,
-                workingDirectory = dir,
+                // No workingDirectory: `command` carries its own cd, so this path and the
+                // reuse path agree on where a command runs.
                 initialCommand = command,
             )
         }.getOrNull() ?: return false
 
         ownedTerminal = CommandTerminal(host.windowId, host.tabId, newTabId)
-        // Stamped, not skipped: createTab is given `initialCommand`, so the tab does not
-        // start idle — it starts running this command, and the next delivery needs that
-        // when deciding whether a warning is warranted.
-        markSent()
         runCatching { api.switchToTab(host.windowId, host.tabId, newTabId) }
         focusHostTab(host.tabId, host.windowId)
         return true
@@ -606,12 +593,6 @@ class DockerActions(private val services: DockerServices) {
         /** Gap before the second Ctrl-C, which is what forces a stubborn client to quit. */
         private const val INTERRUPT_ESCALATE_MS = 400L
 
-        /**
-         * How recently we must have typed for "something may still be running" to be
-         * worth saying. Long enough to cover an ordinary image build, short enough that
-         * picking the plugin up again after a break is silent.
-         */
-        private const val INTERRUPT_WARN_WINDOW_MS = 3 * 60 * 1000L
 
         /**
          * Single-quote a value for the shell. Terminal tabs take a command *string*

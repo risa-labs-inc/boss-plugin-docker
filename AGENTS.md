@@ -86,6 +86,20 @@ queueing, volatile because the accept path reads it off the consumer's thread. I
 toast: reusing one tab makes docker commands mutually exclusive, and killing a running build
 because someone clicked elsewhere must not be silent.
 
+**`openTerminal` returning true means "accepted for delivery", not "running".** The command is
+queued; the consumer types it later. So `buildAndRun` registers `pendingAutoOpen` and the panel
+toasts before anything has been typed, and a command can still fall back to a BOSS tab — or fail
+— after its caller was told it launched. The MCP tools hedge their wording for this; the panel
+toasts do not, because a click has visible consequences the operator is already watching.
+
+**No API-version floor was raised for the terminal reuse.** Everything it uses predates the
+declared `minApiVersion` 1.0.48: `getPluginAPI`, `PluginContext.windowId`, `ActiveTabData.windowId`,
+`hasTerminalState` and `sendInterrupt` land in `boss-plugin-api` **1.0.16**, and
+`TerminalTabPluginAPI` / `createTab` / `switchToTab` / `listTabs` in **1.0.23**. There is therefore
+no host that satisfies the floor but lacks the terminal API. The `runCatching { Throwable }` wrap
+is not the compatibility contract — it is there for the case that terminal-tab simply is not
+loaded, which now logs rather than degrading in silence.
+
 **`openTab` is fire-and-forget.** The host drops a tab silently if no factory is registered
 for its type, so `openServiceTabVerified` polls `activeTabs` and reports what actually
 happened instead of assuming success.
