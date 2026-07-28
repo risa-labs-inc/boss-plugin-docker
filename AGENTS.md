@@ -80,7 +80,9 @@ executes — and the sequence must be indivisible, or a second command's interru
 first has been typed and the first swallows it. A `synchronized` block that launches the send does
 **not** achieve that. One consumer also keeps this off the UI thread (panel clicks call
 `openTerminal` directly, and these are cross-plugin calls whose threading contract the plugin does
-not control) and lets `ownedTerminal` be a plain private `var`. Interrupting is announced with a
+not control). `ownedTerminal` is a `@Volatile private var` in `DockerActions` rather than a
+field on the shared services object — private so no call site can retarget the tab without
+queueing, volatile because the accept path reads it off the consumer's thread. Interrupting is announced with a
 toast: reusing one tab makes docker commands mutually exclusive, and killing a running build
 because someone clicked elsewhere must not be silent.
 

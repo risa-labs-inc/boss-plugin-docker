@@ -129,9 +129,14 @@ class DockerMcpToolProvider(
                 val hostPort = args.int("host_port") ?: DockerActions.freePort()
                 val name = services.actions.buildAndRun(artifact, hostPort, containerPort)
                     ?: return@McpToolHandler McpToolResult("Couldn't open a terminal tab to run the build.", isError = true)
+                // Deliberately hedged. The build runs in the plugin's shared terminal
+                // tab, so a docker command issued behind it interrupts it — reporting
+                // "it will start" would be a promise this cannot keep. Ask docker_ps.
                 McpToolResult(
-                    "Building ${file.absolutePath} in a terminal tab. " +
-                        "It will start as container '$name' on http://localhost:$hostPort.",
+                    "Building ${file.absolutePath} in the docker terminal tab. " +
+                        "If the build completes it starts as container '$name' on " +
+                        "http://localhost:$hostPort — check docker_ps. Issuing another " +
+                        "docker command first interrupts this one.",
                 )
             },
         ),

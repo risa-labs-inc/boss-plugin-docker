@@ -40,6 +40,7 @@ class DockerServices(val context: PluginContext) {
 
     fun start() {
         engine.start()
+        actions.start()
         scope.launch {
             _autoOpenServiceTab.value = getPref(KEY_AUTO_OPEN, "true").toBoolean()
         }
@@ -50,6 +51,7 @@ class DockerServices(val context: PluginContext) {
 
     fun dispose() {
         autoOpenWatcher?.cancel()
+        actions.dispose()
         engine.dispose()
         scope.cancel()
     }

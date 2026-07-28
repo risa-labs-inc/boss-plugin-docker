@@ -65,11 +65,40 @@ class DockerActions(private val services: DockerServices) {
     private var ownedTerminal: CommandTerminal? = null
     private var hasSentCommand = false
 
-    /** One command per send, drained in order by [runTerminalCommands]. */
+    /**
+     * One command per send, drained in order by [runTerminalCommands].
+     *
+     * Unbounded, which is what makes a dead consumer dangerous rather than merely
+     * broken: `trySend` keeps succeeding, so [runInExistingTerminal] keeps returning
+     * true and every later command is reported as launched while nothing is ever typed.
+     * Hence the guard in the consumer loop and in [fallBackToBossTab], and [dispose]
+     * closing the channel.
+     */
     private val terminalCommands = Channel<TerminalCommand>(Channel.UNLIMITED)
 
-    init {
+    /**
+     * Start draining [terminalCommands]. Called from [DockerServices.start].
+     *
+     * Not an `init` block: this class is constructed from a `DockerServices` property
+     * initializer, so launching there would depend on `scope` happening to be declared
+     * above `actions` — reorder those two lines and the plugin fails to activate with an
+     * NPE and no obvious cause. An explicit call makes the ordering a fact rather than
+     * an accident.
+     */
+    fun start() {
         services.scope.launch { runTerminalCommands() }
+    }
+
+    /**
+     * Stop accepting commands.
+     *
+     * Closing matters as much as cancelling the scope: on a closed channel `trySend`
+     * fails, so [runInExistingTerminal] returns false and a command issued during
+     * teardown falls through to the BOSS-tab path instead of being accepted by a
+     * consumer that will never run and reported as a success.
+     */
+    fun dispose() {
+        terminalCommands.close()
     }
 
     // -------------------------------------------------------------- run flow
@@ -183,8 +212,9 @@ class DockerActions(private val services: DockerServices) {
      * fills the tab bar within minutes of ordinary use, and BossTerm already has a
      * tab strip built for this.
      *
-     * Falls back to a new BOSS terminal tab when there is no live terminal in this
-     * window to join, or when the terminal-tab plugin isn't loaded.
+     * Falls back to a new BOSS terminal tab when there is no live terminal to join at
+     * all, or when the terminal-tab plugin isn't loaded. A terminal in this window is
+     * preferred but not required — see [findTerminalHost].
      */
     fun openTerminal(
         id: String,
@@ -223,8 +253,9 @@ class DockerActions(private val services: DockerServices) {
      * terminal's *active* tab, so reusing "whatever is focused" would inject a
      * `docker build` into whatever the user happens to be running there.
      *
-     * Only the *decision* happens here, and only cheaply: is there a terminal to join
-     * at all? Everything that touches the terminal is queued to [terminalCommands] and
+     * Only the *decision* happens here: is there a terminal to join at all? That is a
+     * `getPluginAPI` plus one `hasTerminalState` registry lookup per open tab — cheap,
+     * but not free, and on a panel click it is the UI thread. Everything that touches the terminal is queued to [terminalCommands] and
      * performed by one consumer, because the delivery is a multi-step sequence
      * (interrupt, wait, type) that must not interleave with another command's — see
      * [runTerminalCommands]. A `true` return therefore means "accepted for delivery",
@@ -280,12 +311,10 @@ class DockerActions(private val services: DockerServices) {
      */
     private suspend fun runTerminalCommands() {
         for (queued in terminalCommands) {
-            // One bad command must not cost the feature. If this body throws, the
-            // consumer dies — and because the channel is UNLIMITED, `trySend` keeps
-            // succeeding, so `runInExistingTerminal` keeps returning true and every
-            // later build reports "Building …" while nothing is typed and no tab
-            // appears. Both `getPluginAPI` (linkage) and the toast calls
-            // (cross-plugin) can throw here, so the guard catches Throwable.
+            // One bad command must not cost the feature: a consumer that dies takes
+            // every later command with it, silently (see [terminalCommands]). Both
+            // `getPluginAPI` (linkage) and the toast calls (cross-plugin) can throw
+            // here, so the guard catches Throwable.
             try {
                 deliver(queued)
             } catch (cancel: CancellationException) {
@@ -324,10 +353,8 @@ class DockerActions(private val services: DockerServices) {
      * which is a worse outcome than the pre-reuse behaviour.
      */
     private fun fallBackToBossTab(queued: TerminalCommand) {
-        // Guarded as a whole, including the toasts. This runs inside the consumer's catch
-        // block, so an exception escaping here kills the consumer — and because the
-        // channel is UNLIMITED, `trySend` would keep succeeding and every later command
-        // would report success with nothing typed, for the rest of the session.
+        // Guarded as a whole, including the toasts: this runs inside the consumer's catch
+        // block, so anything escaping here kills the consumer (see [terminalCommands]).
         // `toastError` reaches the host's notification provider, so it is not exempt.
         runCatching {
             val ops = services.context.splitViewOperations
@@ -391,19 +418,17 @@ class DockerActions(private val services: DockerServices) {
         tabs: List<ActiveTabData>,
     ): Boolean {
         // Switch first, and this is what makes the interrupt safe: sendInterrupt and
-        // sendCommand take no tabId, so both act on the terminal's *active* tab.
-        // BossTerm applies the switch synchronously (TabController.switchToTab assigns
-        // activeTabIndex, and activeTab is derived from it), so there is nothing to wait
-        // for here — without the switch the Ctrl-C could land on the user's own tab.
+        // sendCommand take no tabId, so both act on the terminal's *active* tab, and
+        // without the switch a Ctrl-C could land on the user's own tab.
+        //
+        // Safe to do from this (background) thread, and the reason is specific rather
+        // than assumed: BossTerm resolves the target by *reading state*, not by waiting
+        // for recomposition. TabController.activeTabIndex is `by mutableStateOf`, so a
+        // write from any thread lands in the global snapshot immediately, and `activeTab`
+        // is a plain getter over it (`tabs.getOrNull(activeTabIndex)`). The interrupt
+        // therefore sees the switched tab in the same call chain, with nothing to settle.
         if (!runCatching { api.switchToTab(owned.windowId, owned.terminalId, owned.tabId) }.getOrDefault(false)) {
             return false
-        }
-        if (hasSentCommand) {
-            // Deliberately not phrased as "interrupting the previous command": nothing
-            // tells us whether one is still running, and a toast that cries wolf on
-            // every command is the one that gets tuned out — including on the occasion
-            // it is reporting a real two-minute build being killed.
-            services.toastInfo("Reusing the docker terminal — anything still running there is stopped")
         }
         runCatching { api.sendInterrupt(owned.windowId, owned.terminalId) }
         delay(INTERRUPT_ESCALATE_MS)
@@ -411,6 +436,17 @@ class DockerActions(private val services: DockerServices) {
         delay(SHELL_REGAIN_LINE_MS)
         val sent = runCatching { api.sendCommand(owned.windowId, owned.terminalId, full) }.getOrDefault(false)
         if (sent) {
+            // Reported only once the send succeeded. Announcing the interrupt first meant
+            // a failed send killed whatever was running, said so, and *then* opened a
+            // BOSS tab anyway — the worst of both, and two notifications for one command.
+            //
+            // Deliberately not phrased as "interrupting the previous command": nothing
+            // tells us whether one was still running, and a toast that cries wolf every
+            // time is the one that gets tuned out on the occasion it is reporting a real
+            // two-minute build being killed.
+            if (hasSentCommand) {
+                services.toastInfo("Reusing the docker terminal — anything still running there is stopped")
+            }
             hasSentCommand = true
             focusHostTab(tabs, owned.terminalId, owned.windowId)
         }
