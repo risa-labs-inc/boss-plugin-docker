@@ -53,7 +53,7 @@ class DockerActions(private val services: DockerServices) {
      * atomicity is needed. `ownedTerminal` is `@Volatile` because [runInExistingTerminal]
      * reads it from the caller's thread on the accept path; a stale `null` there only
      * costs one command a BOSS tab it could have shared, and the consumer re-validates
-     * through [liveOwnedTerminal] regardless. `hasSentCommand` is consumer-only.
+     * through [liveOwnedTerminal] regardless. `lastSendAtMs` is consumer-only.
      *
      * Kept here rather than on [DockerServices] so that guarantee is structural — a
      * public field on the shared services object is one any future call site can write
@@ -63,7 +63,13 @@ class DockerActions(private val services: DockerServices) {
      */
     @Volatile
     private var ownedTerminal: CommandTerminal? = null
-    private var hasSentCommand = false
+
+    /** When the consumer last typed into the owned tab; 0 if it never has. */
+    private var lastSendAtMs = 0L
+
+    private fun markSent() {
+        lastSendAtMs = System.currentTimeMillis()
+    }
 
     /**
      * One command per send, drained in order by [runTerminalCommands].
@@ -99,6 +105,16 @@ class DockerActions(private val services: DockerServices) {
      */
     fun dispose() {
         terminalCommands.close()
+        // Named rather than dropped in silence. Anything still queued was already
+        // reported as launched, so a note is the difference between a debuggable
+        // teardown and a mystery.
+        val dropped = generateSequence { terminalCommands.tryReceive().getOrNull() }.toList()
+        if (dropped.isNotEmpty()) {
+            System.err.println(
+                "[Docker] Dropped ${dropped.size} queued command(s) on dispose: " +
+                    dropped.joinToString("; ") { it.command },
+            )
+        }
     }
 
     // -------------------------------------------------------------- run flow
@@ -331,13 +347,17 @@ class DockerActions(private val services: DockerServices) {
         val api = services.context.getPluginAPI(TerminalTabPluginAPI::class.java)
         val tabs = services.context.activeTabsProvider?.activeTabs?.value
         if (api == null || tabs == null) {
+            // Said out loud rather than swallowed: on a host where the terminal-tab
+            // plugin simply isn't loaded, this degrades to a BOSS tab per command — the
+            // clutter this path exists to remove — with nothing to explain why.
+            System.err.println("[Docker] No terminal-tab API; opening a BOSS tab for: ${queued.command}")
             fallBackToBossTab(queued)
             return
         }
         val full = if (queued.workingDir == null) queued.command else "cd ${q(queued.workingDir)} && ${queued.command}"
         val owned = liveOwnedTerminal(api, tabs)
         val delivered = if (owned != null) {
-            deliverToOwnedTab(api, owned, full, tabs)
+            deliverToOwnedTab(api, owned, full)
         } else {
             createOwnedTab(api, tabs, queued.command, queued.workingDir)
         }
@@ -415,7 +435,6 @@ class DockerActions(private val services: DockerServices) {
         api: TerminalTabPluginAPI,
         owned: CommandTerminal,
         full: String,
-        tabs: List<ActiveTabData>,
     ): Boolean {
         // Switch first, and this is what makes the interrupt safe: sendInterrupt and
         // sendCommand take no tabId, so both act on the terminal's *active* tab, and
@@ -444,11 +463,21 @@ class DockerActions(private val services: DockerServices) {
             // tells us whether one was still running, and a toast that cries wolf every
             // time is the one that gets tuned out on the occasion it is reporting a real
             // two-minute build being killed.
-            if (hasSentCommand) {
+            // Only when something plausibly *was* running. `hasSentCommand` was useless
+            // as a guard: deliverToOwnedTab is reachable only once an owned tab exists,
+            // and creating one sets the flag — so it was always true and the toast fired
+            // on every single command, which is the cry-wolf case this is meant to avoid.
+            // Elapsed time is still a heuristic (nothing reports liveness —
+            // boss-plugins#11), but it goes quiet for the common shape: run something,
+            // read the output, run the next thing.
+            val since = System.currentTimeMillis() - lastSendAtMs
+            if (lastSendAtMs != 0L && since < INTERRUPT_WARN_WINDOW_MS) {
                 services.toastInfo("Reusing the docker terminal — anything still running there is stopped")
             }
-            hasSentCommand = true
-            focusHostTab(tabs, owned.terminalId, owned.windowId)
+            markSent()
+            // Re-read rather than reusing the snapshot taken before ~1.2 s of delay:
+            // focusing a tab that has since moved is benign but wrong, and this is free.
+            focusHostTab(owned.terminalId, owned.windowId)
         }
         return sent
     }
@@ -471,13 +500,12 @@ class DockerActions(private val services: DockerServices) {
         }.getOrNull() ?: return false
 
         ownedTerminal = CommandTerminal(host.windowId, host.tabId, newTabId)
-        // True, not false: createTab is given `initialCommand`, so the tab does not start
-        // idle — it starts running this command. Clearing the flag here meant the *second*
-        // command of a session interrupted the first with no warning at all, which is the
-        // case the toast exists for.
-        hasSentCommand = true
+        // Stamped, not skipped: createTab is given `initialCommand`, so the tab does not
+        // start idle — it starts running this command, and the next delivery needs that
+        // when deciding whether a warning is warranted.
+        markSent()
         runCatching { api.switchToTab(host.windowId, host.tabId, newTabId) }
-        focusHostTab(tabs, host.tabId, host.windowId)
+        focusHostTab(host.tabId, host.windowId)
         return true
     }
 
@@ -510,7 +538,8 @@ class DockerActions(private val services: DockerServices) {
      *
      * Matched on window as well as tab: a tab id alone can name another window's tab.
      */
-    private fun focusHostTab(tabs: List<ActiveTabData>, terminalId: String, windowId: String) {
+    private fun focusHostTab(terminalId: String, windowId: String) {
+        val tabs = services.context.activeTabsProvider?.activeTabs?.value ?: return
         val host = tabs.firstOrNull { it.tabId == terminalId && it.windowId == windowId } ?: return
         runCatching { services.context.activeTabsProvider?.selectTab(host.tabId, host.panelId) }
     }
@@ -576,6 +605,13 @@ class DockerActions(private val services: DockerServices) {
 
         /** Gap before the second Ctrl-C, which is what forces a stubborn client to quit. */
         private const val INTERRUPT_ESCALATE_MS = 400L
+
+        /**
+         * How recently we must have typed for "something may still be running" to be
+         * worth saying. Long enough to cover an ordinary image build, short enough that
+         * picking the plugin up again after a break is silent.
+         */
+        private const val INTERRUPT_WARN_WINDOW_MS = 3 * 60 * 1000L
 
         /**
          * Single-quote a value for the shell. Terminal tabs take a command *string*
