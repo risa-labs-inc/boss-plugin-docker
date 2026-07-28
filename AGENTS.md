@@ -82,9 +82,11 @@ first has been typed and the first swallows it. A `synchronized` block that laun
 `openTerminal` directly, and these are cross-plugin calls whose threading contract the plugin does
 not control). `ownedTerminal` is a `@Volatile private var` in `DockerActions` rather than a
 field on the shared services object — private so no call site can retarget the tab without
-queueing, volatile because the accept path reads it off the consumer's thread. Interrupting is announced with a
-toast: reusing one tab makes docker commands mutually exclusive, and killing a running build
-because someone clicked elsewhere must not be silent.
+queueing, volatile because the accept path reads it off the consumer's thread. Reusing one tab makes docker commands
+mutually exclusive — a second build or compose command stops the first — and that is said
+**prospectively**, by the MCP tool descriptions and results and by the panel's own toast, not by a
+notification afterwards. There is no liveness signal to gate an after-the-fact toast on
+(boss-plugins#11), so every guard written for one was either vacuous or fired on every command.
 
 **`openTerminal` returning true means "accepted for delivery", not "running".** The command is
 queued; the consumer types it later. So `buildAndRun` registers `pendingAutoOpen` and the panel
@@ -94,7 +96,7 @@ toasts do not, because a click has visible consequences the operator is already 
 
 **No API-version floor was raised for the terminal reuse.** Everything it uses predates the
 declared `minApiVersion` 1.0.48: `getPluginAPI`, `PluginContext.windowId`, `ActiveTabData.windowId`,
-`hasTerminalState` and `sendInterrupt` land in `boss-plugin-api` **1.0.16**, and
+`hasTerminalState`, `sendCommand` and `sendInterrupt` land in `boss-plugin-api` **1.0.16**, and
 `TerminalTabPluginAPI` / `createTab` / `switchToTab` / `listTabs` in **1.0.23**. There is therefore
 no host that satisfies the floor but lacks the terminal API. The `runCatching { Throwable }` wrap
 is not the compatibility contract — it is there for the case that terminal-tab simply is not

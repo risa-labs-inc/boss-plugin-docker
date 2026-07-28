@@ -47,7 +47,7 @@ class DockerActions(private val services: DockerServices) {
     private val pendingAutoOpen = LinkedHashMap<String, Long>()
 
     /**
-     * The terminal tab this plugin owns, and whether anything has been typed into it.
+     * The terminal tab this plugin owns.
      *
      * Written **only** by [runTerminalCommands], of which there is exactly one, so no
      * atomicity is needed. `ownedTerminal` is `@Volatile` because [runInExistingTerminal]
@@ -63,7 +63,6 @@ class DockerActions(private val services: DockerServices) {
      */
     @Volatile
     private var ownedTerminal: CommandTerminal? = null
-
 
     /**
      * One command per send, drained in order by [runTerminalCommands].
@@ -97,6 +96,9 @@ class DockerActions(private val services: DockerServices) {
      * teardown falls through to the BOSS-tab path instead of being accepted by a
      * consumer that will never run and reported as a success.
      */
+    /** The plugin has no host logger; this keeps the one prefix in one place. */
+    private fun log(message: String) = System.err.println("[Docker] $message")
+
     fun dispose() {
         terminalCommands.close()
         // Named rather than dropped in silence. Anything still queued was already
@@ -104,10 +106,7 @@ class DockerActions(private val services: DockerServices) {
         // teardown and a mystery.
         val dropped = generateSequence { terminalCommands.tryReceive().getOrNull() }.toList()
         if (dropped.isNotEmpty()) {
-            System.err.println(
-                "[Docker] Dropped ${dropped.size} queued command(s) on dispose: " +
-                    dropped.joinToString("; ") { it.command },
-            )
+            log("Dropped ${dropped.size} queued command(s) on dispose: " + dropped.joinToString("; ") { it.command })
         }
     }
 
@@ -256,50 +255,38 @@ class DockerActions(private val services: DockerServices) {
     }
 
     /**
-     * Hand [command] to the terminal tab this plugin owns.
+     * Queue [command] for the terminal tab this plugin owns.
      *
      * Two things this must not do. Create a tab per command — that is the bug being
      * fixed. And type into a tab the plugin doesn't own: `sendCommand` writes to the
      * terminal's *active* tab, so reusing "whatever is focused" would inject a
      * `docker build` into whatever the user happens to be running there.
      *
-     * Only the *decision* happens here: is there a terminal to join at all? That is a
-     * `getPluginAPI` plus one `hasTerminalState` registry lookup per open tab — cheap,
-     * but not free, and on a panel click it is the UI thread. Everything that touches the terminal is queued to [terminalCommands] and
-     * performed by one consumer, because the delivery is a multi-step sequence
-     * (interrupt, wait, type) that must not interleave with another command's — see
-     * [runTerminalCommands]. A `true` return therefore means "accepted for delivery",
-     * which is why the consumer, not this function, is what reports a failure.
+     * Nothing is inspected here, deliberately. Deciding whether a terminal exists meant
+     * a `getPluginAPI` plus a `hasTerminalState` registry lookup **per open tab**, on
+     * the caller's thread — which for a panel click is the UI thread, and scales with
+     * tab count. The consumer already re-checks all of it and already handles "no
+     * terminal to join" by opening a BOSS tab, so the work was duplicated as well as
+     * misplaced. The only thing given up is a synchronous false, and on this path the
+     * return was already advisory: it means "accepted for delivery", not "running".
      *
-     * Wrapped whole rather than per call. A host whose terminal-tab plugin is absent or
-     * older than the interface fails at *linkage* — `NoClassDefFoundError` on the
-     * `TerminalTabPluginAPI::class.java` literal, `NoSuchMethodError` on a call — and
-     * those are `Error`s thrown on entry, which a `runCatching` inside the method never
-     * runs to catch. `runCatching` here catches `Throwable`, so a missing terminal
-     * degrades to the BOSS-tab path instead of taking down build/run.
+     * `trySend` fails only on a closed channel, i.e. after [dispose], which is the one
+     * case where the caller should fall through to opening a tab itself.
      */
     private fun runInExistingTerminal(
         id: String,
         title: String,
         command: String,
         workingDir: String?,
-    ): Boolean =
-        runCatching {
-            // Reads only; the consumer owns every write. `ownedTerminal` is @Volatile
-            // because this read is genuinely off the consumer's thread — a stale null
-            // just means one command opens a BOSS tab that could have joined ours, and
-            // the consumer re-validates anyway.
-            val api = services.context.getPluginAPI(TerminalTabPluginAPI::class.java) ?: return false
-            val tabs = services.context.activeTabsProvider?.activeTabs?.value ?: return false
-            if (ownedTerminal == null && findTerminalHost(api, tabs) == null) return false
-            // Never leave the directory implicit. On reuse the tab sits wherever the
-            // last command left it, so a null workingDir would run this command in
-            // another project's directory — composeDown passes null on its
-            // `-p <project>` fallback, and runImage's projectPath is itself nullable.
-            val dir = workingDir?.takeIf { it.isNotBlank() }
-                ?: services.context.projectPath?.takeIf { it.isNotBlank() }
-            terminalCommands.trySend(TerminalCommand(id, title, command, dir)).isSuccess
-        }.getOrDefault(false)
+    ): Boolean {
+        // Never leave the directory implicit. On reuse the tab sits wherever the last
+        // command left it, so a null workingDir would run this command in another
+        // project's directory — composeDown passes null on its `-p <project>` fallback,
+        // and runImage's projectPath is itself nullable.
+        val dir = workingDir?.takeIf { it.isNotBlank() }
+            ?: services.context.projectPath?.takeIf { it.isNotBlank() }
+        return terminalCommands.trySend(TerminalCommand(id, title, command, dir)).isSuccess
+    }
 
     /**
      * The single consumer of [terminalCommands].
@@ -318,19 +305,19 @@ class DockerActions(private val services: DockerServices) {
     private suspend fun runTerminalCommands() {
         for (queued in terminalCommands) {
             // One bad command must not cost the feature: a consumer that dies takes
-            // every later command with it, silently (see [terminalCommands]). Both
-            // `getPluginAPI` (linkage) and the toast calls (cross-plugin) can throw
-            // here, so the guard catches Throwable.
+            // every later command with it, silently (see [terminalCommands]).
+            // `getPluginAPI` can fail at linkage and the fallback's toast is a
+            // cross-plugin call, so the guard catches Throwable rather than Exception.
             try {
                 deliver(queued)
             } catch (cancel: CancellationException) {
                 // Named for the same reason dispose() names what it drops: this command was
                 // already reported as launched, and it is the one most likely to matter,
                 // because it was mid-delivery rather than still queued.
-                System.err.println("[Docker] Cancelled mid-delivery: ${queued.command}")
+                log("Cancelled mid-delivery: ${queued.command}")
                 throw cancel // plugin is being disposed; not a delivery failure
             } catch (t: Throwable) {
-                System.err.println("[Docker] Terminal delivery failed: $t")
+                log("Terminal delivery failed: $t")
                 fallBackToBossTab(queued)
             }
         }
@@ -344,7 +331,7 @@ class DockerActions(private val services: DockerServices) {
             // Said out loud rather than swallowed: on a host where the terminal-tab
             // plugin simply isn't loaded, this degrades to a BOSS tab per command — the
             // clutter this path exists to remove — with nothing to explain why.
-            System.err.println("[Docker] No terminal-tab API; opening a BOSS tab for: ${queued.command}")
+            log("No terminal-tab API; opening a BOSS tab for: ${queued.command}")
             fallBackToBossTab(queued)
             return
         }
@@ -365,7 +352,7 @@ class DockerActions(private val services: DockerServices) {
             // that exists but refuses writes would otherwise stay owned forever: every later
             // command would pay two Ctrl-Cs and 1.2 s, kill whatever is in it, and open a
             // BOSS tab anyway — the clutter this exists to prevent, on a loop, in silence.
-            System.err.println("[Docker] Terminal refused the command; dropping the owned tab")
+            log("Terminal refused the command; dropping the owned tab")
             ownedTerminal = null
             fallBackToBossTab(queued)
         }
@@ -398,7 +385,7 @@ class DockerActions(private val services: DockerServices) {
                 ),
             )
         }.onFailure { failure ->
-            System.err.println("[Docker] Terminal fallback failed: $failure")
+            log("Terminal fallback failed: $failure")
             runCatching {
                 services.toastError("Couldn't reach the terminal — run manually: ${queued.command}")
             }
@@ -420,11 +407,13 @@ class DockerActions(private val services: DockerServices) {
     /**
      * Type [full] into the tab we own, interrupting whatever is running there first.
      *
-     * Reusing one tab makes docker commands mutually exclusive, and that is a real cost
-     * rather than a free win: building project A and then running `compose down` on
-     * project B stops A's build. So it is announced. Silently killing a two-minute build
-     * because the operator clicked something else is the kind of thing that reads as a
-     * bug in docker.
+     * Reusing one tab makes docker commands mutually exclusive, and that is a real cost:
+     * building project A and then running `compose down` on project B stops A's build.
+     * That is said **prospectively** — by the MCP tool descriptions and results, and by
+     * the panel's own toast — rather than by a notification after the fact. There is no
+     * liveness signal to gate an after-the-fact toast on (boss-plugins#11), so any guard
+     * for one is either vacuous or fires on every command; two attempts at it were both
+     * dead code before this settled.
      *
      * **The wait before typing is a heuristic, and the known weak point here.**
      * `sendCommand` writes to the pty, so the shell has to be the one reading by the
@@ -462,10 +451,6 @@ class DockerActions(private val services: DockerServices) {
         delay(SHELL_REGAIN_LINE_MS)
         val sent = runCatching { api.sendCommand(owned.windowId, owned.terminalId, full) }.getOrDefault(false)
         if (sent) {
-            // Deliberately not phrased as "interrupting the previous command": nothing
-            // tells us whether one was still running, and a toast that cries wolf every
-            // time is the one that gets tuned out on the occasion it is reporting a real
-            // two-minute build being killed.
             // Re-read rather than reusing the snapshot taken before ~1.2 s of delay:
             // focusing a tab that has since moved is benign but wrong, and this is free.
             focusHostTab(owned.terminalId, owned.windowId)
@@ -516,7 +501,7 @@ class DockerActions(private val services: DockerServices) {
         }
         return hosts.firstOrNull { it.windowId == myWindow }
             ?: hosts.firstOrNull()?.also {
-                System.err.println("[Docker] No terminal in window $myWindow; using one in ${it.windowId}")
+                log("No terminal in window $myWindow; using one in ${it.windowId}")
             }
     }
 
@@ -592,7 +577,6 @@ class DockerActions(private val services: DockerServices) {
 
         /** Gap before the second Ctrl-C, which is what forces a stubborn client to quit. */
         private const val INTERRUPT_ESCALATE_MS = 400L
-
 
         /**
          * Single-quote a value for the shell. Terminal tabs take a command *string*

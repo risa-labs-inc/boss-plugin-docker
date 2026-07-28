@@ -131,13 +131,19 @@ class DockerPanelViewModel(private val services: DockerServices) {
         _runRequest.value = null
         val name = services.actions.buildAndRun(request.artifact, host, container)
         if (name != null) {
-            services.toastInfo("Building ${request.artifact.suggestedName} → localhost:$host")
+            // Names the shared tab on purpose. Two Run clicks in a row do not build in
+            // parallel any more — the second stops the first — so a bare "Building A"
+            // followed by "Building B" would leave the operator believing both are alive.
+            services.toastInfo(
+                "Building ${request.artifact.suggestedName} → localhost:$host in the docker terminal " +
+                    "(a later build or compose command stops it)",
+            )
         }
     }
 
     fun composeUp(artifact: ProjectArtifact) {
         if (services.actions.composeUp(artifact)) {
-            services.toastInfo("Starting ${artifact.suggestedName}…")
+            services.toastInfo("Starting ${artifact.suggestedName} in the docker terminal…")
         }
     }
 
@@ -148,7 +154,7 @@ class DockerPanelViewModel(private val services: DockerServices) {
             confirmLabel = "Down",
         ) {
             if (services.actions.composeDown(project)) {
-                services.toastInfo("Stopping ${project.name}…")
+                services.toastInfo("Stopping ${project.name} in the docker terminal…")
             }
         }
     }

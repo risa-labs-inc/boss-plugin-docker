@@ -104,8 +104,9 @@ class DockerMcpToolProvider(
             name = "docker_build",
             description = "Build a Dockerfile and run it, publishing a port on 127.0.0.1. " +
                 "Runs in the plugin's shared docker terminal tab, then starts the container " +
-                "detached. Issuing another docker command interrupts a build still in " +
-                "progress, so confirm with docker_ps rather than assuming it finished.",
+                "detached. Another docker build or compose command interrupts a build still " +
+                "in progress; docker_ps and the other read/lifecycle tools do not, so " +
+                "confirming with docker_ps is safe.",
             inputSchema = """
                 {"type":"object","properties":{
                   "dockerfile":{"type":"string","description":"Path to the Dockerfile (absolute, or relative to the project)"},
@@ -137,8 +138,8 @@ class DockerMcpToolProvider(
                 McpToolResult(
                     "Building ${file.absolutePath} in the docker terminal tab. " +
                         "If the build completes it starts as container '$name' on " +
-                        "http://localhost:$hostPort — check docker_ps. Issuing another " +
-                        "docker command first interrupts this one.",
+                        "http://localhost:$hostPort — check docker_ps, which is safe. Only " +
+                        "another docker build or compose command interrupts this one.",
                 )
             },
         ),
@@ -189,8 +190,8 @@ class DockerMcpToolProvider(
         McpToolDefinition(
             name = "docker_compose_up",
             description = "Bring a compose project up (detached, with --build) in the plugin's " +
-                "shared docker terminal tab. Issuing another docker command interrupts it while " +
-                "it is still running, so confirm with docker_compose_ls rather than assuming.",
+                "shared docker terminal tab. Another docker build or compose command interrupts " +
+                "it while it is still running; docker_compose_ls and the other read tools do not.",
             inputSchema = """
                 {"type":"object","properties":{
                   "file":{"type":"string","description":"Path to the compose file (absolute, or relative to the project)"}
@@ -206,8 +207,8 @@ class DockerMcpToolProvider(
                 if (services.actions.composeUp(artifact)) {
                     McpToolResult(
                         "Running `docker compose up --build -d` for ${file.absolutePath} in the " +
-                            "docker terminal tab. Check docker_compose_ls for the result — " +
-                            "issuing another docker command first interrupts this one.",
+                            "docker terminal tab. Check docker_compose_ls, which is safe — only " +
+                            "another docker build or compose command interrupts this one.",
                     )
                 } else {
                     McpToolResult("Couldn't open a terminal tab.", isError = true)
@@ -218,8 +219,8 @@ class DockerMcpToolProvider(
         McpToolDefinition.withRbac(
             name = "docker_compose_down",
             description = "Stop and remove a compose project's containers, in the plugin's shared " +
-                "docker terminal tab. Issuing another docker command interrupts it while it is " +
-                "still running, so confirm with docker_compose_ls rather than assuming.",
+                "docker terminal tab. Another docker build or compose command interrupts it while " +
+                "it is still running; docker_compose_ls and the other read tools do not.",
             inputSchema = """
                 {"type":"object","properties":{
                   "project":{"type":"string","description":"Compose project name (see docker_compose_ls)"}
@@ -236,8 +237,8 @@ class DockerMcpToolProvider(
                 if (services.actions.composeDown(project)) {
                     McpToolResult(
                         "Running `docker compose down` for $name in the docker terminal tab. " +
-                            "Check docker_compose_ls for the result — issuing another docker " +
-                            "command first interrupts this one.",
+                            "Check docker_compose_ls, which is safe — only another docker build " +
+                            "or compose command interrupts this one.",
                     )
                 } else {
                     McpToolResult("Couldn't open a terminal tab.", isError = true)

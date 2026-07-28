@@ -51,9 +51,13 @@ class DockerServices(val context: PluginContext) {
 
     fun dispose() {
         autoOpenWatcher?.cancel()
-        actions.dispose()
         engine.dispose()
+        // Before actions.dispose(): that drains the queue to report what was lost, and
+        // with the consumer still alive the two race — the count under-reports and an
+        // item the consumer wins is delivered mid-teardown. Cancelling first makes the
+        // log authoritative.
         scope.cancel()
+        actions.dispose()
     }
 
     fun setAutoOpenServiceTab(enabled: Boolean) {
