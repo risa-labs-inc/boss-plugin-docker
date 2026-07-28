@@ -72,6 +72,18 @@ the LAN because someone clicked Run.
 itself rather than the host's `genericDialogProvider`, because that provider is nullable and
 "the host didn't give us a dialog" must never degrade into "we deleted it without asking".
 
+**Terminal commands go through one consumer, not a lock.** `DockerActions` decides only
+*whether* a terminal exists and enqueues to a `Channel`; a single coroutine drains it and performs
+every switch → interrupt → wait → send. The interrupt is required because `sendCommand` writes to
+the tab's pty, so while a foreground process runs the text goes to *that process's stdin* and never
+executes — and the sequence must be indivisible, or a second command's interrupt lands before the
+first has been typed and the first swallows it. A `synchronized` block that launches the send does
+**not** achieve that. One consumer also keeps this off the UI thread (panel clicks call
+`openTerminal` directly, and these are cross-plugin calls whose threading contract the plugin does
+not control) and lets `ownedTerminal` be a plain private `var`. Interrupting is announced with a
+toast: reusing one tab makes docker commands mutually exclusive, and killing a running build
+because someone clicked elsewhere must not be silent.
+
 **`openTab` is fire-and-forget.** The host drops a tab silently if no factory is registered
 for its type, so `openServiceTabVerified` polls `activeTabs` and reports what actually
 happened instead of assuming success.
