@@ -28,6 +28,20 @@ class DockerServices(val context: PluginContext) {
     val engine = DockerEngine(scope) { context.projectPath }
     val actions = DockerActions(this)
 
+    /**
+     * The one terminal tab this plugin owns for running commands, as
+     * (windowId, terminalId, tabId).
+     *
+     * Every docker command reuses this single tab instead of creating one per
+     * command. It is deliberately *our* tab rather than whatever happens to be
+     * focused: `sendCommand` types into the terminal's active tab, so without an
+     * owned tab a build could be typed into the user's own shell session.
+     *
+     * Session-scoped and never persisted — tab ids don't survive a restart.
+     */
+    @Volatile
+    var commandTerminal: CommandTerminal? = null
+
     private val storage: PluginStorageProvider? by lazy {
         runCatching { context.pluginStorageFactory?.createStorage(PLUGIN_ID) }.getOrNull()
     }
@@ -153,6 +167,13 @@ class DockerServices(val context: PluginContext) {
         private const val TAB_POLL_INTERVAL_MS = 100L
     }
 }
+
+/** Identifies the terminal tab the plugin runs its commands in. */
+data class CommandTerminal(
+    val windowId: String,
+    val terminalId: String,
+    val tabId: String,
+)
 
 /** What [DockerServices.openServiceTabVerified] observed. */
 enum class TabOpenOutcome {
