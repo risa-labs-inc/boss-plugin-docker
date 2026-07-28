@@ -103,7 +103,9 @@ class DockerMcpToolProvider(
         McpToolDefinition(
             name = "docker_build",
             description = "Build a Dockerfile and run it, publishing a port on 127.0.0.1. " +
-                "Opens a BOSS terminal tab showing the build, then starts the container detached.",
+                "Runs in the plugin's shared docker terminal tab, then starts the container " +
+                "detached. Issuing another docker command interrupts a build still in " +
+                "progress, so confirm with docker_ps rather than assuming it finished.",
             inputSchema = """
                 {"type":"object","properties":{
                   "dockerfile":{"type":"string","description":"Path to the Dockerfile (absolute, or relative to the project)"},
@@ -186,7 +188,9 @@ class DockerMcpToolProvider(
 
         McpToolDefinition(
             name = "docker_compose_up",
-            description = "Bring a compose project up (detached, with --build) in a BOSS terminal tab.",
+            description = "Bring a compose project up (detached, with --build) in the plugin's " +
+                "shared docker terminal tab. Issuing another docker command interrupts it while " +
+                "it is still running, so confirm with docker_compose_ls rather than assuming.",
             inputSchema = """
                 {"type":"object","properties":{
                   "file":{"type":"string","description":"Path to the compose file (absolute, or relative to the project)"}
@@ -200,7 +204,11 @@ class DockerMcpToolProvider(
                     ?: return@McpToolHandler McpToolResult("Compose file not found: $path", isError = true)
                 val artifact = ProjectArtifact(file, ProjectArtifact.Kind.COMPOSE, file.name)
                 if (services.actions.composeUp(artifact)) {
-                    McpToolResult("Running `docker compose up --build -d` for ${file.absolutePath} in a terminal tab.")
+                    McpToolResult(
+                        "Running `docker compose up --build -d` for ${file.absolutePath} in the " +
+                            "docker terminal tab. Check docker_compose_ls for the result — " +
+                            "issuing another docker command first interrupts this one.",
+                    )
                 } else {
                     McpToolResult("Couldn't open a terminal tab.", isError = true)
                 }
@@ -209,7 +217,9 @@ class DockerMcpToolProvider(
 
         McpToolDefinition.withRbac(
             name = "docker_compose_down",
-            description = "Stop and remove a compose project's containers.",
+            description = "Stop and remove a compose project's containers, in the plugin's shared " +
+                "docker terminal tab. Issuing another docker command interrupts it while it is " +
+                "still running, so confirm with docker_compose_ls rather than assuming.",
             inputSchema = """
                 {"type":"object","properties":{
                   "project":{"type":"string","description":"Compose project name (see docker_compose_ls)"}
@@ -224,7 +234,11 @@ class DockerMcpToolProvider(
                 val project = engine.composeProjects.value.firstOrNull { it.name == name }
                     ?: return@McpToolHandler McpToolResult("No compose project named '$name'.", isError = true)
                 if (services.actions.composeDown(project)) {
-                    McpToolResult("Running `docker compose down` for $name in a terminal tab.")
+                    McpToolResult(
+                        "Running `docker compose down` for $name in the docker terminal tab. " +
+                            "Check docker_compose_ls for the result — issuing another docker " +
+                            "command first interrupts this one.",
+                    )
                 } else {
                     McpToolResult("Couldn't open a terminal tab.", isError = true)
                 }
