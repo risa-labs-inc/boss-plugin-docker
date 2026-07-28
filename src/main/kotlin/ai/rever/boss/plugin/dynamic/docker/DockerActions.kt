@@ -28,6 +28,9 @@ class DockerActions(private val services: DockerServices) {
     /** Containers we launched and want to auto-open, name → deadline (epoch ms). */
     private val pendingAutoOpen = LinkedHashMap<String, Long>()
 
+    /** Guards the read-act-write of [DockerServices.commandTerminal]. */
+    private val terminalLock = Any()
+
     // -------------------------------------------------------------- run flow
 
     /**
@@ -181,66 +184,127 @@ class DockerActions(private val services: DockerServices) {
      * terminal's *active* tab, so reusing "whatever is focused" would inject a
      * `docker build` into whatever the user happens to be running there.
      *
+     * Wrapped whole rather than per-call. Each individual API call already has its
+     * own `runCatching`, but a host whose terminal-tab plugin is absent or older than
+     * the interface fails at *linkage* — `NoClassDefFoundError` on the
+     * `TerminalTabPluginAPI::class.java` literal, `NoSuchMethodError` on a call — and
+     * those are `Error`s, which a `runCatching` inside the method never gets to run to
+     * catch. `runCatching` here catches `Throwable`, so a missing terminal degrades to
+     * the old open-a-BOSS-tab path instead of taking down build/run.
+     *
      * @return true if the command was delivered to a terminal.
      */
-    private fun runInExistingTerminal(command: String, workingDir: String?): Boolean {
-        // Resolved per call: cross-plugin APIs can appear after our register().
-        val api = services.context.getPluginAPI(TerminalTabPluginAPI::class.java) ?: return false
-        val tabs = services.context.activeTabsProvider?.activeTabs?.value ?: return false
+    private fun runInExistingTerminal(command: String, workingDir: String?): Boolean =
+        runCatching { reuseOwnedTerminal(command, workingDir) }.getOrDefault(false)
 
-        // Reuse our own tab while it is still open.
-        services.commandTerminal?.let { owned ->
-            val stillHosted = tabs.any { it.tabId == owned.terminalId && it.windowId == owned.windowId }
-            val stillOpen = stillHosted && runCatching {
-                api.listTabs(owned.windowId, owned.terminalId).any { it.id == owned.tabId }
-            }.getOrDefault(false)
-            if (stillOpen) {
-                // Switch first: sendCommand targets the active tab, so this is what
-                // guarantees the command lands in ours.
-                val switched = runCatching { api.switchToTab(owned.windowId, owned.terminalId, owned.tabId) }
-                    .getOrDefault(false)
-                if (switched) {
-                    val full = if (workingDir.isNullOrBlank()) command else "cd ${q(workingDir)} && $command"
-                    val sent = runCatching { api.sendCommand(owned.windowId, owned.terminalId, full) }
+    /**
+     * The reuse itself. Serialized: `commandTerminal` is read, acted on and written
+     * here, and the callers are an MCP handler and a panel click on different
+     * dispatchers. `@Volatile` gives visibility, not atomicity — two callers could both
+     * see null, both create a tab, and both write, leaving an orphaned tab and two
+     * commands racing into one pty. The lock also makes the interrupt-then-send
+     * sequence below indivisible.
+     */
+    private fun reuseOwnedTerminal(command: String, workingDir: String?): Boolean =
+        synchronized(terminalLock) {
+            // Resolved per call: cross-plugin APIs can appear after our register().
+            val api = services.context.getPluginAPI(TerminalTabPluginAPI::class.java) ?: return false
+            val tabs = services.context.activeTabsProvider?.activeTabs?.value ?: return false
+            // Never leave the directory implicit. On reuse the tab sits wherever the
+            // last command left it, so a null workingDir would run this command in
+            // another project's directory — composeDown passes null on its
+            // `-p <project>` fallback, and runImage's projectPath is itself nullable.
+            val dir = workingDir?.takeIf { it.isNotBlank() }
+                ?: services.context.projectPath?.takeIf { it.isNotBlank() }
+
+            // Reuse our own tab while it is still open.
+            services.commandTerminal?.let { owned ->
+                val stillHosted = tabs.any { it.tabId == owned.terminalId && it.windowId == owned.windowId }
+                val stillOpen = stillHosted && runCatching {
+                    api.listTabs(owned.windowId, owned.terminalId).any { it.id == owned.tabId }
+                }.getOrDefault(false)
+                if (stillOpen) {
+                    // Switch first: sendCommand targets the active tab, so this is what
+                    // guarantees the command lands in ours.
+                    val switched = runCatching { api.switchToTab(owned.windowId, owned.terminalId, owned.tabId) }
                         .getOrDefault(false)
-                    if (sent) {
-                        focusHostTab(tabs, owned.terminalId)
+                    if (switched && sendToOwnedTab(api, owned, command, dir)) {
+                        focusHostTab(tabs, owned.terminalId, owned.windowId)
                         return true
                     }
                 }
+                // Gone or unusable — forget it and create a fresh one below.
+                services.commandTerminal = null
             }
-            // Gone or unusable — forget it and create a fresh one below.
-            services.commandTerminal = null
+
+            // Probe every tab rather than filtering on a typeId string: hasTerminalState
+            // is a registry lookup and the authoritative answer to "is this a tabbed
+            // terminal?", so it can't drift if the type id is renamed. Prefer this
+            // window's terminals over another window's.
+            val myWindow = services.context.windowId
+            val candidate = tabs.asSequence()
+                .sortedByDescending { it.windowId == myWindow }
+                .firstOrNull { runCatching { api.hasTerminalState(it.windowId, it.tabId) }.getOrDefault(false) }
+                ?: return false
+
+            val newTabId = runCatching {
+                api.createTab(
+                    windowId = candidate.windowId,
+                    terminalId = candidate.tabId,
+                    workingDirectory = dir,
+                    initialCommand = command,
+                )
+            }.getOrNull() ?: return false
+
+            services.commandTerminal = CommandTerminal(candidate.windowId, candidate.tabId, newTabId)
+            runCatching { api.switchToTab(candidate.windowId, candidate.tabId, newTabId) }
+            focusHostTab(tabs, candidate.tabId, candidate.windowId)
+            return true
         }
 
-        // Probe every tab rather than filtering on a typeId string: hasTerminalState
-        // is a registry lookup and the authoritative answer to "is this a tabbed
-        // terminal?", so it can't drift if the type id is renamed. Prefer this
-        // window's terminals over another window's.
-        val myWindow = services.context.windowId
-        val candidate = tabs.asSequence()
-            .sortedByDescending { it.windowId == myWindow }
-            .firstOrNull { runCatching { api.hasTerminalState(it.windowId, it.tabId) }.getOrDefault(false) }
-            ?: return false
-
-        val newTabId = runCatching {
-            api.createTab(
-                windowId = candidate.windowId,
-                terminalId = candidate.tabId,
-                workingDirectory = workingDir,
-                initialCommand = command,
-            )
-        }.getOrNull() ?: return false
-
-        services.commandTerminal = CommandTerminal(candidate.windowId, candidate.tabId, newTabId)
-        runCatching { api.switchToTab(candidate.windowId, candidate.tabId, newTabId) }
-        focusHostTab(tabs, candidate.tabId)
+    /**
+     * Deliver [command] to the tab we own, interrupting whatever is running there first.
+     *
+     * The interrupt is the load-bearing part. `sendCommand` writes to the tab's pty, so
+     * with a foreground process still running — a two-minute `docker build`, a
+     * `compose up` — the text goes to *that process's stdin* and is never queued and
+     * never run. Returning true there would have the MCP tool answer "Building …" for
+     * a command that vanished. Ctrl-C first means the shell is the one reading.
+     *
+     * This is the same switch → Ctrl-C → delay → send sequence terminal-tab itself uses
+     * for a re-run, including the 500 ms it waits for the shell to regain the line, and
+     * it is why the whole thing sits under [terminalLock]: two commands interleaving
+     * here would interrupt each other's send.
+     *
+     * Interrupting is the direct consequence of "reuse one tab": this tab exists only
+     * for the plugin's own commands, so the thing being interrupted is always an
+     * earlier docker command that the new one supersedes.
+     */
+    private fun sendToOwnedTab(
+        api: TerminalTabPluginAPI,
+        owned: CommandTerminal,
+        command: String,
+        dir: String?,
+    ): Boolean {
+        val full = if (dir == null) command else "cd ${q(dir)} && $command"
+        runCatching { api.sendInterrupt(owned.windowId, owned.terminalId) }
+        // Off the caller's thread: the caller may be the UI thread, and blocking it for
+        // half a second to type a command is a visible stall.
+        services.scope.launch {
+            kotlinx.coroutines.delay(SHELL_REGAIN_LINE_MS)
+            runCatching { api.sendCommand(owned.windowId, owned.terminalId, full) }
+        }
         return true
     }
 
-    /** Bring the BOSS tab hosting the terminal forward so the output is visible. */
-    private fun focusHostTab(tabs: List<ActiveTabData>, terminalId: String) {
-        val host = tabs.firstOrNull { it.tabId == terminalId } ?: return
+    /**
+     * Bring the BOSS tab hosting the terminal forward so the output is visible.
+     *
+     * Matched on window as well as tab: the candidate search deliberately spans windows,
+     * so a tab id alone can name a different window's tab.
+     */
+    private fun focusHostTab(tabs: List<ActiveTabData>, terminalId: String, windowId: String) {
+        val host = tabs.firstOrNull { it.tabId == terminalId && it.windowId == windowId } ?: return
         runCatching { services.context.activeTabsProvider?.selectTab(host.tabId, host.panelId) }
     }
 
@@ -294,6 +358,12 @@ class DockerActions(private val services: DockerServices) {
 
     companion object {
         private const val AUTO_OPEN_WINDOW_MS = 10 * 60 * 1000L
+
+        /**
+         * How long to let the shell regain the line after Ctrl-C before typing.
+         * Matches terminal-tab's own re-run delay, which defaults to the same 500 ms.
+         */
+        private const val SHELL_REGAIN_LINE_MS = 500L
 
         /**
          * Single-quote a value for the shell. Terminal tabs take a command *string*
