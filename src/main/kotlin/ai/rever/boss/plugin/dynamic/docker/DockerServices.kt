@@ -160,18 +160,6 @@ class DockerServices(val context: PluginContext) {
     }
 }
 
-/**
- * Identifies the terminal tab the plugin runs its commands in.
- *
- * Held privately by [DockerActions], which is the only thing that may change it — a
- * public field here would let any call site retarget the tab without going through the
- * command queue that keeps deliveries in order.
- */
-data class CommandTerminal(
-    val windowId: String,
-    val terminalId: String,
-    val tabId: String,
-)
 
 /** What [DockerServices.openServiceTabVerified] observed. */
 enum class TabOpenOutcome {

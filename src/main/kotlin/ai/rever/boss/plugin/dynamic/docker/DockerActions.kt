@@ -9,10 +9,24 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 import java.net.ServerSocket
 
 /** Where a launched terminal tab should be placed. */
 enum class OpenLocation { NEW_TAB, SPLIT_RIGHT, SPLIT_DOWN }
+
+/**
+ * Identifies the terminal tab the plugin runs its commands in.
+ *
+ * File-private and held only by [DockerActions], so the encapsulation the consumer
+ * design depends on is structural: nothing outside this file can retarget the tab
+ * without going through the queue.
+ */
+private data class CommandTerminal(
+    val windowId: String,
+    val terminalId: String,
+    val tabId: String,
+)
 
 /**
  * A command awaiting delivery to the plugin's terminal tab.
@@ -43,8 +57,16 @@ private data class TerminalCommand(
  */
 class DockerActions(private val services: DockerServices) {
 
-    /** Containers we launched and want to auto-open, name → deadline (epoch ms). */
-    private val pendingAutoOpen = LinkedHashMap<String, Long>()
+    /**
+     * Containers we launched and want to auto-open, name → deadline (epoch ms).
+     *
+     * Concurrent because the two ends genuinely are: `buildAndRun` writes from a panel
+     * click (UI thread) while `onContainersChanged` iterates and removes from the
+     * engine's `Dispatchers.Default` collector. A plain LinkedHashMap here is a
+     * ConcurrentModificationException waiting for the right timing — pre-existing, but
+     * this change is explicitly about getting this file's threading right.
+     */
+    private val pendingAutoOpen = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     /**
      * The terminal tab this plugin owns.
@@ -63,6 +85,12 @@ class DockerActions(private val services: DockerServices) {
      */
     @Volatile
     private var ownedTerminal: CommandTerminal? = null
+
+    /** Commands accepted but not yet taken by the consumer. */
+    private val pending = AtomicInteger(0)
+
+    /** The plugin has no host logger; this keeps the one prefix in one place. */
+    private fun log(message: String) = System.err.println("[Docker] $message")
 
     /**
      * One command per send, drained in order by [runTerminalCommands].
@@ -96,9 +124,6 @@ class DockerActions(private val services: DockerServices) {
      * teardown falls through to the BOSS-tab path instead of being accepted by a
      * consumer that will never run and reported as a success.
      */
-    /** The plugin has no host logger; this keeps the one prefix in one place. */
-    private fun log(message: String) = System.err.println("[Docker] $message")
-
     fun dispose() {
         terminalCommands.close()
         // Named rather than dropped in silence. Anything still queued was already
@@ -285,7 +310,9 @@ class DockerActions(private val services: DockerServices) {
         // and runImage's projectPath is itself nullable.
         val dir = workingDir?.takeIf { it.isNotBlank() }
             ?: services.context.projectPath?.takeIf { it.isNotBlank() }
-        return terminalCommands.trySend(TerminalCommand(id, title, command, dir)).isSuccess
+        val accepted = terminalCommands.trySend(TerminalCommand(id, title, command, dir)).isSuccess
+        if (accepted) pending.incrementAndGet()
+        return accepted
     }
 
     /**
@@ -308,6 +335,7 @@ class DockerActions(private val services: DockerServices) {
             // every later command with it, silently (see [terminalCommands]).
             // `getPluginAPI` can fail at linkage and the fallback's toast is a
             // cross-plugin call, so the guard catches Throwable rather than Exception.
+            pending.decrementAndGet()
             try {
                 deliver(queued)
             } catch (cancel: CancellationException) {
@@ -337,6 +365,7 @@ class DockerActions(private val services: DockerServices) {
         }
         val full = if (queued.workingDir == null) queued.command else "cd ${q(queued.workingDir)} && ${queued.command}"
         val owned = liveOwnedTerminal(api, tabs)
+        val hadOwnTab = owned != null
         val delivered = if (owned != null) {
             deliverToOwnedTab(api, owned, full)
         } else {
@@ -348,12 +377,18 @@ class DockerActions(private val services: DockerServices) {
             createOwnedTab(api, tabs, full)
         }
         if (!delivered) {
-            // Forget the tab. `liveOwnedTerminal` only drops it when it is *gone*, so a tab
-            // that exists but refuses writes would otherwise stay owned forever: every later
-            // command would pay two Ctrl-Cs and 1.2 s, kill whatever is in it, and open a
-            // BOSS tab anyway — the clutter this exists to prevent, on a loop, in silence.
-            log("Terminal refused the command; dropping the owned tab")
-            ownedTerminal = null
+            // Two different failures, and conflating them is what you would be debugging
+            // from: no tabbed terminal open anywhere, versus our own tab refusing a write.
+            if (hadOwnTab) {
+                // Forget it. `liveOwnedTerminal` only drops a tab that is *gone*, so one
+                // that exists but refuses writes would stay owned forever: every later
+                // command paying two Ctrl-Cs and 1.2 s, killing whatever is in it, and
+                // opening a BOSS tab anyway — on a loop, in silence.
+                log("Our terminal tab refused the command; dropping it")
+                ownedTerminal = null
+            } else {
+                log("No tabbed terminal to join; opening a BOSS tab")
+            }
             fallBackToBossTab(queued)
         }
     }
@@ -410,10 +445,8 @@ class DockerActions(private val services: DockerServices) {
      * Reusing one tab makes docker commands mutually exclusive, and that is a real cost:
      * building project A and then running `compose down` on project B stops A's build.
      * That is said **prospectively** — by the MCP tool descriptions and results, and by
-     * the panel's own toast — rather than by a notification after the fact. There is no
-     * liveness signal to gate an after-the-fact toast on (boss-plugins#11), so any guard
-     * for one is either vacuous or fires on every command; two attempts at it were both
-     * dead code before this settled.
+     * the panel's own toast — never by a notification after the fact; see AGENTS.md for
+     * why an after-the-fact one cannot be gated correctly.
      *
      * **The wait before typing is a heuristic, and the known weak point here.**
      * `sendCommand` writes to the pty, so the shell has to be the one reading by the
@@ -436,12 +469,18 @@ class DockerActions(private val services: DockerServices) {
         // sendCommand take no tabId, so both act on the terminal's *active* tab, and
         // without the switch a Ctrl-C could land on the user's own tab.
         //
-        // Safe to do from this (background) thread, and the reason is specific rather
-        // than assumed: BossTerm resolves the target by *reading state*, not by waiting
-        // for recomposition. TabController.activeTabIndex is `by mutableStateOf`, so a
-        // write from any thread lands in the global snapshot immediately, and `activeTab`
-        // is a plain getter over it (`tabs.getOrNull(activeTabIndex)`). The interrupt
-        // therefore sees the switched tab in the same call chain, with nothing to settle.
+        // Two things verified against BossTerm rather than assumed (compose-ui
+        // TabController, as of bossterm-compose 1.2.129):
+        //
+        // It is safe from this background thread because BossTerm resolves the target by
+        // *reading state*, not by waiting for recomposition: `activeTabIndex` is
+        // `by mutableStateOf`, so a write from any thread lands in the global snapshot at
+        // once, and `activeTab` is a plain getter over it.
+        //
+        // And a `false` here really does mean "no such tab": `switchToTabById` returns
+        // false only when the id is not found, and true when the tab is already active
+        // (the no-op early return is inside the index-based overload it delegates to). So
+        // treating false as fatal cannot misfire on the common already-focused case.
         if (!runCatching { api.switchToTab(owned.windowId, owned.terminalId, owned.tabId) }.getOrDefault(false)) {
             return false
         }
@@ -449,6 +488,14 @@ class DockerActions(private val services: DockerServices) {
         delay(INTERRUPT_ESCALATE_MS)
         runCatching { api.sendInterrupt(owned.windowId, owned.terminalId) }
         delay(SHELL_REGAIN_LINE_MS)
+        // A command already waiting means this one is superseded the moment it is typed:
+        // the consumer returns as soon as sendCommand lands, so the next item's interrupt
+        // fires ~0 ms later and this gets no runway at all. The tool wording hedges for
+        // it ("if the build completes"), but silence in the terminal is confusing, so say
+        // it where someone debugging would look.
+        if (pending.get() > 0) {
+            log("Another command is already queued; this one will be interrupted almost immediately")
+        }
         val sent = runCatching { api.sendCommand(owned.windowId, owned.terminalId, full) }.getOrDefault(false)
         if (sent) {
             // Re-read rather than reusing the snapshot taken before ~1.2 s of delay:
