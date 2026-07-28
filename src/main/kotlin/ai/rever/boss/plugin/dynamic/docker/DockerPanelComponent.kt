@@ -33,7 +33,6 @@ import androidx.compose.material.TextButton
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.ExpandMore
-import androidx.compose.material.icons.outlined.Inventory2
 import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.OpenInBrowser
 import androidx.compose.material.icons.outlined.PlayArrow
@@ -183,7 +182,7 @@ private fun DaemonStoppedBody(viewModel: DockerPanelViewModel) {
         verticalArrangement = Arrangement.Center,
     ) {
         Icon(
-            imageVector = Icons.Outlined.Inventory2,
+            imageVector = DockerIcon,
             contentDescription = null,
             tint = BossThemeColors.TextMuted.copy(alpha = 0.5f),
             modifier = Modifier.size(36.dp),
@@ -237,7 +236,7 @@ private fun EmptyBody(title: String, detail: String) {
         verticalArrangement = Arrangement.Center,
     ) {
         Icon(
-            imageVector = Icons.Outlined.Inventory2,
+            imageVector = DockerIcon,
             contentDescription = null,
             tint = BossThemeColors.TextMuted.copy(alpha = 0.5f),
             modifier = Modifier.size(36.dp),

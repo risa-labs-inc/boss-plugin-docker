@@ -38,7 +38,6 @@ import androidx.compose.material.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.Delete
-import androidx.compose.material.icons.outlined.Inventory2
 import androidx.compose.material.icons.outlined.OpenInBrowser
 import androidx.compose.material.icons.outlined.Pause
 import androidx.compose.material.icons.outlined.PlayArrow
@@ -448,7 +447,7 @@ private fun CenteredNotice(title: String, detail: String) {
         verticalArrangement = Arrangement.Center,
     ) {
         Icon(
-            imageVector = Icons.Outlined.Inventory2,
+            imageVector = DockerIcon,
             contentDescription = null,
             tint = BossThemeColors.TextMuted.copy(alpha = 0.5f),
             modifier = Modifier.size(40.dp),
