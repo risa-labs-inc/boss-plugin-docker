@@ -4,6 +4,7 @@ import ai.rever.boss.plugin.api.ActiveTabData
 import ai.rever.boss.plugin.api.TabSplitMode
 import ai.rever.boss.plugin.api.TerminalTabPluginAPI
 import ai.rever.boss.plugin.tab.terminal.TerminalTabInfo
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -13,8 +14,20 @@ import java.net.ServerSocket
 /** Where a launched terminal tab should be placed. */
 enum class OpenLocation { NEW_TAB, SPLIT_RIGHT, SPLIT_DOWN }
 
-/** A command awaiting delivery to the plugin's terminal tab, with its resolved cwd. */
-private data class TerminalCommand(val command: String, val workingDir: String?)
+/**
+ * A command awaiting delivery to the plugin's terminal tab.
+ *
+ * Carries [id] and [title] as well as the command so the consumer can still open a
+ * BOSS terminal tab if the terminal it was queued for has gone away — the fallback
+ * [DockerActions.openTerminal] documents is otherwise unreachable once that function
+ * has returned true.
+ */
+private data class TerminalCommand(
+    val id: String,
+    val title: String,
+    val command: String,
+    val workingDir: String?,
+)
 
 /**
  * The build/run split.
@@ -175,7 +188,7 @@ class DockerActions(private val services: DockerServices) {
         workingDir: String?,
         location: OpenLocation = OpenLocation.NEW_TAB,
     ): Boolean {
-        if (location == OpenLocation.NEW_TAB && runInExistingTerminal(command, workingDir)) {
+        if (location == OpenLocation.NEW_TAB && runInExistingTerminal(id, title, command, workingDir)) {
             return true
         }
 
@@ -219,7 +232,12 @@ class DockerActions(private val services: DockerServices) {
      * runs to catch. `runCatching` here catches `Throwable`, so a missing terminal
      * degrades to the BOSS-tab path instead of taking down build/run.
      */
-    private fun runInExistingTerminal(command: String, workingDir: String?): Boolean =
+    private fun runInExistingTerminal(
+        id: String,
+        title: String,
+        command: String,
+        workingDir: String?,
+    ): Boolean =
         runCatching {
             // No lock: these are reads, and the consumer owns every write.
             val api = services.context.getPluginAPI(TerminalTabPluginAPI::class.java) ?: return false
@@ -231,7 +249,7 @@ class DockerActions(private val services: DockerServices) {
             // `-p <project>` fallback, and runImage's projectPath is itself nullable.
             val dir = workingDir?.takeIf { it.isNotBlank() }
                 ?: services.context.projectPath?.takeIf { it.isNotBlank() }
-            terminalCommands.trySend(TerminalCommand(command, dir)).isSuccess
+            terminalCommands.trySend(TerminalCommand(id, title, command, dir)).isSuccess
         }.getOrDefault(false)
 
     /**
@@ -253,21 +271,66 @@ class DockerActions(private val services: DockerServices) {
      * contract the plugin does not control.
      */
     private suspend fun runTerminalCommands() {
-        for ((command, dir) in terminalCommands) {
-            val api = services.context.getPluginAPI(TerminalTabPluginAPI::class.java)
-            val tabs = services.context.activeTabsProvider?.activeTabs?.value
-            if (api == null || tabs == null) {
-                services.toastError("No terminal available — run manually: $command")
-                continue
+        for (queued in terminalCommands) {
+            // One bad command must not cost the feature. If this body throws, the
+            // consumer dies — and because the channel is UNLIMITED, `trySend` keeps
+            // succeeding, so `runInExistingTerminal` keeps returning true and every
+            // later build reports "Building …" while nothing is typed and no tab
+            // appears. Both `getPluginAPI` (linkage) and the toast calls
+            // (cross-plugin) can throw here, so the guard catches Throwable.
+            try {
+                deliver(queued)
+            } catch (cancel: CancellationException) {
+                throw cancel // plugin is being disposed; not a delivery failure
+            } catch (t: Throwable) {
+                System.err.println("[Docker] Terminal delivery failed: $t")
+                fallBackToBossTab(queued)
             }
-            val full = if (dir == null) command else "cd ${q(dir)} && $command"
-            val owned = liveOwnedTerminal(api, tabs)
-            if (owned != null) {
-                deliverToOwnedTab(api, owned, full, tabs)
-            } else if (!createOwnedTab(api, tabs, command, dir)) {
-                // The terminal that existed when the command was accepted is gone.
-                services.toastError("Couldn't reach the terminal — run manually: $command")
-            }
+        }
+    }
+
+    /** Deliver one queued command, reusing our tab or creating it. */
+    private suspend fun deliver(queued: TerminalCommand) {
+        val api = services.context.getPluginAPI(TerminalTabPluginAPI::class.java)
+        val tabs = services.context.activeTabsProvider?.activeTabs?.value
+        if (api == null || tabs == null) {
+            fallBackToBossTab(queued)
+            return
+        }
+        val full = if (queued.workingDir == null) queued.command else "cd ${q(queued.workingDir)} && ${queued.command}"
+        val owned = liveOwnedTerminal(api, tabs)
+        val delivered = if (owned != null) {
+            deliverToOwnedTab(api, owned, full, tabs)
+        } else {
+            createOwnedTab(api, tabs, queued.command, queued.workingDir)
+        }
+        if (!delivered) fallBackToBossTab(queued)
+    }
+
+    /**
+     * Open a BOSS terminal tab for a command we couldn't hand to the owned one.
+     *
+     * This is the fallback [openTerminal]'s KDoc promises, reached late. By the time a
+     * command drains, the terminal that existed when it was accepted may be gone — and
+     * without this the only remaining option was telling the operator to run it by hand,
+     * which is a worse outcome than the pre-reuse behaviour.
+     */
+    private fun fallBackToBossTab(queued: TerminalCommand) {
+        val ops = services.context.splitViewOperations ?: run {
+            services.toastError("No terminal available — run manually: ${queued.command}")
+            return
+        }
+        runCatching {
+            ops.openTab(
+                TerminalTabInfo(
+                    id = queued.id,
+                    title = queued.title,
+                    initialCommand = queued.command,
+                    workingDirectory = queued.workingDir,
+                ),
+            )
+        }.onFailure {
+            services.toastError("Couldn't reach the terminal — run manually: ${queued.command}")
         }
     }
 
@@ -291,31 +354,50 @@ class DockerActions(private val services: DockerServices) {
      * project B stops A's build. So it is announced. Silently killing a two-minute build
      * because the operator clicked something else is the kind of thing that reads as a
      * bug in docker.
+     *
+     * **The wait before typing is a heuristic, and the known weak point here.**
+     * `sendCommand` writes to the pty, so the shell has to be the one reading by the
+     * time it lands; the API exposes no prompt or liveness signal to wait *for*, only a
+     * sleep. `docker build` under BuildKit traps SIGINT and cleans up, which can outlast
+     * a single short delay, so the interrupt is sent twice with the wait split around
+     * it: docker's own CLI escalates on the second SIGINT ("got 1 SIGTERM/SIGINTs,
+     * forcing shutdown"), and a second Ctrl-C costs an idle shell nothing but a fresh
+     * prompt line. Retrying the *command* instead would risk running it twice, which is
+     * worse than losing it. A liveness query on the terminal API is the real fix.
+     *
+     * @return true if the command was typed.
      */
     private suspend fun deliverToOwnedTab(
         api: TerminalTabPluginAPI,
         owned: CommandTerminal,
         full: String,
         tabs: List<ActiveTabData>,
-    ) {
-        // Switch first: sendCommand targets the active tab, so this is what guarantees
-        // the command lands in ours.
+    ): Boolean {
+        // Switch first, and this is what makes the interrupt safe: sendInterrupt and
+        // sendCommand take no tabId, so both act on the terminal's *active* tab.
+        // BossTerm applies the switch synchronously (TabController.switchToTab assigns
+        // activeTabIndex, and activeTab is derived from it), so there is nothing to wait
+        // for here — without the switch the Ctrl-C could land on the user's own tab.
         if (!runCatching { api.switchToTab(owned.windowId, owned.terminalId, owned.tabId) }.getOrDefault(false)) {
-            services.toastError("Couldn't reach the terminal — run manually: $full")
-            return
+            return false
         }
         if (hasSentCommand) {
-            services.toastInfo("Interrupting the previous docker command in the terminal")
+            // Deliberately not phrased as "interrupting the previous command": nothing
+            // tells us whether one is still running, and a toast that cries wolf on
+            // every command is the one that gets tuned out — including on the occasion
+            // it is reporting a real two-minute build being killed.
+            services.toastInfo("Reusing the docker terminal — anything still running there is stopped")
         }
+        runCatching { api.sendInterrupt(owned.windowId, owned.terminalId) }
+        delay(INTERRUPT_ESCALATE_MS)
         runCatching { api.sendInterrupt(owned.windowId, owned.terminalId) }
         delay(SHELL_REGAIN_LINE_MS)
         val sent = runCatching { api.sendCommand(owned.windowId, owned.terminalId, full) }.getOrDefault(false)
         if (sent) {
             hasSentCommand = true
             focusHostTab(tabs, owned.terminalId, owned.windowId)
-        } else {
-            services.toastError("Couldn't reach the terminal — run manually: $full")
         }
+        return sent
     }
 
     /** Create the tab we will own from now on, running [command] as it starts. */
@@ -425,10 +507,15 @@ class DockerActions(private val services: DockerServices) {
         private const val AUTO_OPEN_WINDOW_MS = 10 * 60 * 1000L
 
         /**
-         * How long to let the shell regain the line after Ctrl-C before typing.
-         * Matches terminal-tab's own re-run delay, which defaults to the same 500 ms.
+         * How long to let the shell regain the line after the last Ctrl-C before typing.
+         * terminal-tab's own re-run delay defaults to 500 ms, but that is for an *idle*
+         * tab; here a live process may still be tearing down, so the total wait is
+         * longer and split around a second interrupt.
          */
-        private const val SHELL_REGAIN_LINE_MS = 500L
+        private const val SHELL_REGAIN_LINE_MS = 800L
+
+        /** Gap before the second Ctrl-C, which is what forces a stubborn client to quit. */
+        private const val INTERRUPT_ESCALATE_MS = 400L
 
         /**
          * Single-quote a value for the shell. Terminal tabs take a command *string*
