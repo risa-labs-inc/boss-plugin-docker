@@ -131,7 +131,14 @@ class DockerMcpToolProvider(
                     ?: 8080
                 val hostPort = args.int("host_port") ?: DockerActions.freePort()
                 val name = services.actions.buildAndRun(artifact, hostPort, containerPort)
-                    ?: return@McpToolHandler McpToolResult("Couldn't open a terminal tab to run the build.", isError = true)
+                    ?: return@McpToolHandler McpToolResult(
+                        // Reachable only after dispose(): for NEW_TAB, openTerminal now
+                        // returns "accepted for delivery", and acceptance fails only on a
+                        // closed channel. A terminal that turns out to be missing is
+                        // handled by the consumer, which opens a BOSS tab.
+                        "Couldn't queue the build — the plugin is shutting down.",
+                        isError = true,
+                    )
                 // Deliberately hedged. The build runs in the plugin's shared terminal
                 // tab, so a docker command issued behind it interrupts it — reporting
                 // "it will start" would be a promise this cannot keep. Ask docker_ps.
@@ -211,7 +218,8 @@ class DockerMcpToolProvider(
                             "another docker build or compose command interrupts this one.",
                     )
                 } else {
-                    McpToolResult("Couldn't open a terminal tab.", isError = true)
+                    // Reachable only after dispose() — see docker_build above.
+                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
                 }
             },
         ),
@@ -241,7 +249,8 @@ class DockerMcpToolProvider(
                             "or compose command interrupts this one.",
                     )
                 } else {
-                    McpToolResult("Couldn't open a terminal tab.", isError = true)
+                    // Reachable only after dispose() — see docker_build above.
+                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
                 }
             },
         ),
