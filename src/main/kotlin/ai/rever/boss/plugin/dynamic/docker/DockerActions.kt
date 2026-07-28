@@ -49,14 +49,19 @@ class DockerActions(private val services: DockerServices) {
     /**
      * The terminal tab this plugin owns, and whether anything has been typed into it.
      *
-     * Plain `var`s, not `@Volatile`: [runTerminalCommands] is the only reader or writer
-     * and there is exactly one of it, so there is no cross-thread access to make
-     * visible. Keeping them here rather than on [DockerServices] is what makes that
-     * structural — a public field on the shared services object is one any future call
-     * site can write without going through the queue.
+     * Written **only** by [runTerminalCommands], of which there is exactly one, so no
+     * atomicity is needed. `ownedTerminal` is `@Volatile` because [runInExistingTerminal]
+     * reads it from the caller's thread on the accept path; a stale `null` there only
+     * costs one command a BOSS tab it could have shared, and the consumer re-validates
+     * through [liveOwnedTerminal] regardless. `hasSentCommand` is consumer-only.
+     *
+     * Kept here rather than on [DockerServices] so that guarantee is structural — a
+     * public field on the shared services object is one any future call site can write
+     * without going through the queue.
      *
      * Session-scoped and never persisted; tab ids don't survive a restart.
      */
+    @Volatile
     private var ownedTerminal: CommandTerminal? = null
     private var hasSentCommand = false
 
@@ -239,7 +244,10 @@ class DockerActions(private val services: DockerServices) {
         workingDir: String?,
     ): Boolean =
         runCatching {
-            // No lock: these are reads, and the consumer owns every write.
+            // Reads only; the consumer owns every write. `ownedTerminal` is @Volatile
+            // because this read is genuinely off the consumer's thread — a stale null
+            // just means one command opens a BOSS tab that could have joined ours, and
+            // the consumer re-validates anyway.
             val api = services.context.getPluginAPI(TerminalTabPluginAPI::class.java) ?: return false
             val tabs = services.context.activeTabsProvider?.activeTabs?.value ?: return false
             if (ownedTerminal == null && findTerminalHost(api, tabs) == null) return false
@@ -316,11 +324,17 @@ class DockerActions(private val services: DockerServices) {
      * which is a worse outcome than the pre-reuse behaviour.
      */
     private fun fallBackToBossTab(queued: TerminalCommand) {
-        val ops = services.context.splitViewOperations ?: run {
-            services.toastError("No terminal available — run manually: ${queued.command}")
-            return
-        }
+        // Guarded as a whole, including the toasts. This runs inside the consumer's catch
+        // block, so an exception escaping here kills the consumer — and because the
+        // channel is UNLIMITED, `trySend` would keep succeeding and every later command
+        // would report success with nothing typed, for the rest of the session.
+        // `toastError` reaches the host's notification provider, so it is not exempt.
         runCatching {
+            val ops = services.context.splitViewOperations
+            if (ops == null) {
+                services.toastError("No terminal available — run manually: ${queued.command}")
+                return@runCatching
+            }
             ops.openTab(
                 TerminalTabInfo(
                     id = queued.id,
@@ -329,8 +343,11 @@ class DockerActions(private val services: DockerServices) {
                     workingDirectory = queued.workingDir,
                 ),
             )
-        }.onFailure {
-            services.toastError("Couldn't reach the terminal — run manually: ${queued.command}")
+        }.onFailure { failure ->
+            System.err.println("[Docker] Terminal fallback failed: $failure")
+            runCatching {
+                services.toastError("Couldn't reach the terminal — run manually: ${queued.command}")
+            }
         }
     }
 
@@ -418,9 +435,11 @@ class DockerActions(private val services: DockerServices) {
         }.getOrNull() ?: return false
 
         ownedTerminal = CommandTerminal(host.windowId, host.tabId, newTabId)
-        // A fresh tab starts idle, so the next command is the first that could
-        // interrupt anything.
-        hasSentCommand = false
+        // True, not false: createTab is given `initialCommand`, so the tab does not start
+        // idle — it starts running this command. Clearing the flag here meant the *second*
+        // command of a session interrupted the first with no warning at all, which is the
+        // case the toast exists for.
+        hasSentCommand = true
         runCatching { api.switchToTab(host.windowId, host.tabId, newTabId) }
         focusHostTab(tabs, host.tabId, host.windowId)
         return true
@@ -433,16 +452,21 @@ class DockerActions(private val services: DockerServices) {
      * registry lookup and the authoritative answer to "is this a tabbed terminal?", so
      * it can't drift if the type id is renamed.
      *
-     * Confined to this window on purpose. Searching every window meant a click in
-     * window A could create the tab in window B and pull focus there; falling back to a
-     * new BOSS tab in the window the operator is actually looking at is the less
-     * surprising outcome.
+     * This window is *preferred*, not required. Searching every window meant a click in
+     * window A could create the tab in window B and pull focus there — but filtering hard
+     * would mean a blank or unmatched `context.windowId` silently disables reuse
+     * altogether, bringing back the tab-per-command clutter this path exists to prevent,
+     * with nothing logged. So: prefer, then fall back, and say so.
      */
     private fun findTerminalHost(api: TerminalTabPluginAPI, tabs: List<ActiveTabData>): ActiveTabData? {
         val myWindow = services.context.windowId
-        return tabs.firstOrNull {
-            it.windowId == myWindow && runCatching { api.hasTerminalState(it.windowId, it.tabId) }.getOrDefault(false)
+        val hosts = tabs.filter {
+            runCatching { api.hasTerminalState(it.windowId, it.tabId) }.getOrDefault(false)
         }
+        return hosts.firstOrNull { it.windowId == myWindow }
+            ?: hosts.firstOrNull()?.also {
+                System.err.println("[Docker] No terminal in window $myWindow; using one in ${it.windowId}")
+            }
     }
 
     /**
