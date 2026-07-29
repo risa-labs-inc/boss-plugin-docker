@@ -90,6 +90,17 @@ class DockerActions(private val services: DockerServices) {
     /** Commands accepted but not yet taken by the consumer. */
     private val pending = AtomicInteger(0)
 
+    /**
+     * Whether [start] has run.
+     *
+     * Load-bearing enough to assert: with no consumer, `trySend` succeeds forever and
+     * every command is reported launched and never delivered — the exact failure
+     * [terminalCommands] warns about. The wiring is one call away in another class, so
+     * this is checked rather than assumed.
+     */
+    @Volatile
+    private var started = false
+
     /** The plugin has no host logger; this keeps the one prefix in one place. */
     private fun log(message: String) = System.err.println("[Docker] $message")
 
@@ -114,6 +125,7 @@ class DockerActions(private val services: DockerServices) {
      * an accident.
      */
     fun start() {
+        started = true
         services.scope.launch { runTerminalCommands() }
     }
 
@@ -311,6 +323,7 @@ class DockerActions(private val services: DockerServices) {
         command: String,
         workingDir: String?,
     ): Boolean {
+        check(started) { "DockerActions.start() was never called; commands would queue and never be delivered" }
         // Never leave the directory implicit. On reuse the tab sits wherever the last
         // command left it, so a null workingDir would run this command in another
         // project's directory — composeDown passes null on its `-p <project>` fallback,
@@ -375,7 +388,20 @@ class DockerActions(private val services: DockerServices) {
         val full = if (queued.workingDir == null) queued.command else "cd ${q(queued.workingDir)} && ${queued.command}"
         val owned = liveOwnedTerminal(api, tabs)
         val hadOwnTab = owned != null
-        val delivered = if (owned != null) {
+        val delivered = if (pending.get() > 0 && owned != null) {
+            // Something is already queued behind this one, so delivering it to the shared
+            // tab would type it and then interrupt it ~0 ms later: killed before it did
+            // anything, with its caller already told it was accepted. That is the bug this
+            // whole path fixes, relocated — deterministic for two Run clicks in a row, or
+            // a docker_build followed by a docker_compose_up.
+            //
+            // A sibling tab costs one tab *only under contention*, which by construction
+            // means two commands arrived inside a single delivery. Better than losing a
+            // compose-down. Skipping instead is not an option: a silently dropped
+            // destructive command is worse than a noisy one that starts.
+            log("Another command is queued; running this one in a bottom split rather than superseding it")
+            runInBottomSplit(api, owned, full)
+        } else if (owned != null) {
             deliverToOwnedTab(api, owned, full)
         } else {
             // `full`, not the bare command: both paths then derive the directory the same
@@ -511,19 +537,6 @@ class DockerActions(private val services: DockerServices) {
         runCatching { api.sendInterrupt(owned.windowId, owned.hostTabId) }
         delay(SHELL_REGAIN_LINE_MS)
         if (!focusOurTab()) return false // still ours?
-        // A command already waiting means this one is superseded the moment it is typed:
-        // the consumer returns as soon as sendCommand lands, so the next item's interrupt
-        // fires ~0 ms later and this gets no runway at all.
-        //
-        // Logged rather than skipped, deliberately. Dropping looks like the obvious win
-        // and is not, because it is only safe for some commands: a superseded build or
-        // compose-up is genuinely redundant — the survivor supersedes it — but a
-        // superseded `compose down` would be a *destructive action silently skipped*,
-        // which is worse than a noisy one that at least starts. Acting on this needs that
-        // per-command distinction, not a blanket skip.
-        if (pending.get() > 0) {
-            log("Another command is already queued; this one will be interrupted almost immediately")
-        }
         val sent = runCatching { api.sendCommand(owned.windowId, owned.hostTabId, full) }.getOrDefault(false)
         if (sent) {
             // Re-read rather than reusing the snapshot taken before ~1.2 s of delay:
@@ -554,6 +567,43 @@ class DockerActions(private val services: DockerServices) {
         runCatching { api.switchToTab(host.windowId, host.tabId, newTabId) }
         focusHostTab(host.tabId, host.windowId)
         return true
+    }
+
+    /**
+     * Run [full] in a **bottom split of the tab we already own**, leaving whatever is in
+     * the top pane alone.
+     *
+     * Used under contention — see [deliver]. A split rather than another tab because the
+     * whole point of this path is to stay in one tab; the operator sees the two commands
+     * stacked instead of hunting a tab strip.
+     *
+     * No interrupt here, and that is the reason this exists: the new pane is a fresh
+     * shell, so there is nothing to interrupt and nothing gets superseded. Ownership is
+     * unchanged — the next command still reuses the top pane.
+     *
+     * `splitHorizontal` moves focus to the new pane (BossTerm's `preserveFocus` defaults
+     * to false, and the plugin API does not override it), which is what makes
+     * `writeToFocusedPane` land in the split rather than back in the busy pane. That
+     * ordering is load-bearing; the two calls must stay adjacent.
+     */
+    private fun runInBottomSplit(
+        api: TerminalTabPluginAPI,
+        owned: CommandTerminal,
+        full: String,
+    ): Boolean {
+        val pane = runCatching {
+            api.splitHorizontal(owned.windowId, owned.hostTabId, owned.subTabId)
+        }.getOrNull() ?: return false
+        // Raw write, so the newline is ours to add — unlike sendCommand, which appends it.
+        val wrote = runCatching {
+            api.writeToFocusedPane(owned.windowId, owned.hostTabId, "$full\n", owned.subTabId)
+        }.getOrDefault(false)
+        if (wrote) {
+            focusHostTab(owned.hostTabId, owned.windowId)
+        } else {
+            log("Split pane $pane would not take the command")
+        }
+        return wrote
     }
 
     /**
