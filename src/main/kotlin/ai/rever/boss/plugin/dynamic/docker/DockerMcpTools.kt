@@ -132,11 +132,14 @@ class DockerMcpToolProvider(
                 val hostPort = args.int("host_port") ?: DockerActions.freePort()
                 val name = services.actions.buildAndRun(artifact, hostPort, containerPort)
                     ?: return@McpToolHandler McpToolResult(
-                        // Reachable only after dispose(): for NEW_TAB, openTerminal now
-                        // returns "accepted for delivery", and acceptance fails only on a
-                        // closed channel. A terminal that turns out to be missing is
-                        // handled by the consumer, which opens a BOSS tab.
-                        "Couldn't queue the build — the plugin is shutting down.",
+                        // Deliberately cause-agnostic. This is *not* the "no terminal"
+                        // path — the consumer handles that by opening a BOSS tab — and it
+                        // is not a post-dispose path either, because openTerminal falls
+                        // through to splitViewOperations and returns true there. What
+                        // actually reaches here is a host with no splitViewOperations, or
+                        // a Dockerfile with no parent directory. Naming one of those would
+                        // be specific and usually wrong.
+                        "Couldn't start the build.",
                         isError = true,
                     )
                 // Deliberately hedged. The build runs in the plugin's shared terminal
@@ -218,8 +221,8 @@ class DockerMcpToolProvider(
                             "another docker build or compose command interrupts this one.",
                     )
                 } else {
-                    // Reachable only after dispose() — see docker_build above.
-                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
+                    // Cause-agnostic — see docker_build above for why.
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -249,8 +252,8 @@ class DockerMcpToolProvider(
                             "or compose command interrupts this one.",
                     )
                 } else {
-                    // Reachable only after dispose() — see docker_build above.
-                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
+                    // Cause-agnostic — see docker_build above for why.
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),

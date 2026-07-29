@@ -25,8 +25,10 @@ enum class OpenLocation { NEW_TAB, SPLIT_RIGHT, SPLIT_DOWN }
  */
 private data class CommandTerminal(
     val windowId: String,
-    val terminalId: String,
-    val tabId: String,
+    /** The BOSS tab hosting the tabbed terminal. */
+    val hostTabId: String,
+    /** Our sub-tab *inside* that terminal. */
+    val subTabId: String,
 )
 
 /**
@@ -72,11 +74,9 @@ class DockerActions(private val services: DockerServices) {
     /**
      * The terminal tab this plugin owns.
      *
-     * Confined to the consumer: [runTerminalCommands] is the only reader and writer, and
-     * there is exactly one of it, so no atomicity or visibility is needed today. (The
-     * accept path used to read it too; that went away when it stopped inspecting
-     * anything.) `@Volatile` is kept as belt-and-braces in case a caller-side read is
-     * ever reintroduced — not because one exists.
+     * Confined to the consumer — [runTerminalCommands] is the only reader and writer, and
+     * there is exactly one of it. `@Volatile` is belt-and-braces for a caller-side read
+     * that no longer exists.
      *
      * Kept here rather than on [DockerServices] so that guarantee is structural — a
      * public field on the shared services object is one any future call site can write
@@ -439,9 +439,14 @@ class DockerActions(private val services: DockerServices) {
     /** Our tab, if it is still open; forgets it and returns null otherwise. */
     private fun liveOwnedTerminal(api: TerminalTabPluginAPI, tabs: List<ActiveTabData>): CommandTerminal? {
         val owned = ownedTerminal ?: return null
-        val stillHosted = tabs.any { it.tabId == owned.terminalId && it.windowId == owned.windowId }
+        val stillHosted = tabs.any { it.tabId == owned.hostTabId && it.windowId == owned.windowId }
         val stillOpen = stillHosted && runCatching {
-            api.listTabs(owned.windowId, owned.terminalId).any { it.id == owned.tabId }
+            api.listTabs(owned.windowId, owned.hostTabId).any { it.id == owned.subTabId }
+        }.onFailure {
+            // Logged for the same reason the refusal path is: a listTabs that keeps
+            // throwing drops ownership every time, so every command creates a fresh
+            // sub-tab — the clutter this exists to remove, arriving silently.
+            log("listTabs failed; treating the owned tab as gone: $it")
         }.getOrDefault(false)
         if (stillOpen) return owned
         ownedTerminal = null
@@ -467,6 +472,20 @@ class DockerActions(private val services: DockerServices) {
      * prompt line. Retrying the *command* instead would risk running it twice, which is
      * worse than losing it. A liveness query on the terminal API is the real fix.
      *
+     * `sendInterrupt` and `sendCommand` take no `tabId` — they act on the terminal's
+     * *active* tab — so [focusOurTab] is the only thing keeping them off whatever the
+     * user is doing. It is re-asserted before each write rather than once up front,
+     * because the last write lands 1.2 s after the first check and the active tab can
+     * change in between (the user clicking a sub-tab, made likelier because the plugin
+     * just pulled focus here). No atomic switch-and-write exists, so this shrinks the
+     * window rather than closing it. Free on the happy path: `switchToTabById` returns
+     * true when the tab is already active, false only when the id is unknown.
+     *
+     * Verified against BossTerm compose-ui `TabController` (bossterm-compose 1.2.129):
+     * the switch is safe from this background thread because the target is resolved by
+     * *reading state* — `activeTabIndex` is `by mutableStateOf` and `activeTab` is a
+     * plain getter over it — not by waiting for recomposition.
+     *
      * @return true if the command was typed.
      */
     private suspend fun deliverToOwnedTab(
@@ -478,43 +497,20 @@ class DockerActions(private val services: DockerServices) {
         // sendCommand take no tabId, so both act on the terminal's *active* tab, and
         // without the switch a Ctrl-C could land on the user's own tab.
         //
-        // Re-asserted before *every* write, not once up front.
-        //
-        // sendInterrupt and sendCommand take no tabId — they hit the terminal's *active*
-        // tab — so the switch is what keeps them off the user's tab. Asserting it once
-        // and then sleeping 1.2 s would mean acting on a state verified before the sleep,
-        // and the active tab can change inside that window: the user clicking a sub-tab,
-        // made *more* likely because the plugin just pulled focus to the terminal
-        // mid-work. The consequence is the exact injection this design exists to prevent
-        // — a `docker build` typed into whatever they were running.
-        //
-        // There is no atomic switch-and-write in the API, so the window cannot be closed;
-        // this shrinks it from 1.2 s to the gap between two adjacent calls. It is free on
-        // the happy path because switchToTabById returns true when the tab is already
-        // active, and false only when the id is unknown — which is the correct bail-out.
-        //
-        // Two things verified against BossTerm rather than assumed (compose-ui
-        // TabController, as of bossterm-compose 1.2.129):
-        //
-        // Safe from this background thread because BossTerm resolves the target by
-        // *reading state*, not by waiting for recomposition: `activeTabIndex` is
-        // `by mutableStateOf`, so a write from any thread lands in the global snapshot at
-        // once, and `activeTab` is a plain getter over it.
-        //
-        // And `false` really does mean "no such tab": `switchToTabById` returns false only
-        // when the id is not found (the already-active no-op early return lives in the
-        // index-based overload it delegates to).
+        // Re-asserted before *every* write. See the KDoc: the switch is the only thing
+        // keeping these off the user's tab, and it is verified 1.2 s before the last of
+        // them lands.
         suspend fun focusOurTab(): Boolean =
-            runCatching { api.switchToTab(owned.windowId, owned.terminalId, owned.tabId) }
+            runCatching { api.switchToTab(owned.windowId, owned.hostTabId, owned.subTabId) }
                 .getOrDefault(false)
 
-        if (!focusOurTab()) return false
-        runCatching { api.sendInterrupt(owned.windowId, owned.terminalId) }
+        if (!focusOurTab()) return false // still ours?
+        runCatching { api.sendInterrupt(owned.windowId, owned.hostTabId) }
         delay(INTERRUPT_ESCALATE_MS)
-        if (!focusOurTab()) return false
-        runCatching { api.sendInterrupt(owned.windowId, owned.terminalId) }
+        if (!focusOurTab()) return false // still ours?
+        runCatching { api.sendInterrupt(owned.windowId, owned.hostTabId) }
         delay(SHELL_REGAIN_LINE_MS)
-        if (!focusOurTab()) return false
+        if (!focusOurTab()) return false // still ours?
         // A command already waiting means this one is superseded the moment it is typed:
         // the consumer returns as soon as sendCommand lands, so the next item's interrupt
         // fires ~0 ms later and this gets no runway at all.
@@ -528,11 +524,11 @@ class DockerActions(private val services: DockerServices) {
         if (pending.get() > 0) {
             log("Another command is already queued; this one will be interrupted almost immediately")
         }
-        val sent = runCatching { api.sendCommand(owned.windowId, owned.terminalId, full) }.getOrDefault(false)
+        val sent = runCatching { api.sendCommand(owned.windowId, owned.hostTabId, full) }.getOrDefault(false)
         if (sent) {
             // Re-read rather than reusing the snapshot taken before ~1.2 s of delay:
             // focusing a tab that has since moved is benign but wrong, and this is free.
-            focusHostTab(owned.terminalId, owned.windowId)
+            focusHostTab(owned.hostTabId, owned.windowId)
         }
         return sent
     }
@@ -554,7 +550,7 @@ class DockerActions(private val services: DockerServices) {
             )
         }.getOrNull() ?: return false
 
-        ownedTerminal = CommandTerminal(host.windowId, host.tabId, newTabId)
+        ownedTerminal = CommandTerminal(windowId = host.windowId, hostTabId = host.tabId, subTabId = newTabId)
         runCatching { api.switchToTab(host.windowId, host.tabId, newTabId) }
         focusHostTab(host.tabId, host.windowId)
         return true
@@ -656,6 +652,10 @@ class DockerActions(private val services: DockerServices) {
 
         /** Gap before the second Ctrl-C, which is what forces a stubborn client to quit. */
         private const val INTERRUPT_ESCALATE_MS = 400L
+
+        // TODO(boss-plugins#11): both delays are unconditional, so five queued commands
+        // sleep ~6 s and leave ten stray prompt lines. A liveness query on
+        // TerminalTabPluginAPI would let an idle tab skip the interrupt entirely.
 
         /**
          * Single-quote a value for the shell. Terminal tabs take a command *string*
