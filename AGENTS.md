@@ -72,6 +72,37 @@ the LAN because someone clicked Run.
 itself rather than the host's `genericDialogProvider`, because that provider is nullable and
 "the host didn't give us a dialog" must never degrade into "we deleted it without asking".
 
+**Terminal commands go through one consumer, not a lock.** `DockerActions` decides only
+*whether* a terminal exists and enqueues to a `Channel`; a single coroutine drains it and performs
+every switch → interrupt → wait → send. The interrupt is required because `sendCommand` writes to
+the tab's pty, so while a foreground process runs the text goes to *that process's stdin* and never
+executes — and the sequence must be indivisible, or a second command's interrupt lands before the
+first has been typed and the first swallows it. A `synchronized` block that launches the send does
+**not** achieve that. One consumer also keeps this off the UI thread (panel clicks call
+`openTerminal` directly, and these are cross-plugin calls whose threading contract the plugin does
+not control). `ownedTerminal` is a `private var` in `DockerActions` rather than a field on the shared services
+object, so no call site can retarget the tab without going through the queue. It is confined to
+the consumer — the only reader and writer — and the `@Volatile` on it is belt-and-braces for a
+caller-side read that no longer exists, not a live requirement. Reusing one tab makes docker commands
+mutually exclusive — a second build or compose command stops the first — and that is said
+**prospectively**, by the MCP tool descriptions and results and by the panel's own toast, not by a
+notification afterwards. There is no liveness signal to gate an after-the-fact toast on
+(boss-plugins#11), so every guard written for one was either vacuous or fired on every command.
+
+**`openTerminal` returning true means "accepted for delivery", not "running".** The command is
+queued; the consumer types it later. So `buildAndRun` registers `pendingAutoOpen` and the panel
+toasts before anything has been typed, and a command can still fall back to a BOSS tab — or fail
+— after its caller was told it launched. The MCP tools hedge their wording for this; the panel
+toasts do not, because a click has visible consequences the operator is already watching.
+
+**No API-version floor was raised for the terminal reuse.** Everything it uses predates the
+declared `minApiVersion` 1.0.48: `getPluginAPI`, `PluginContext.windowId`, `ActiveTabData.windowId`,
+`hasTerminalState`, `sendCommand` and `sendInterrupt` land in `boss-plugin-api` **1.0.16**, and
+`TerminalTabPluginAPI` / `createTab` / `switchToTab` / `listTabs` in **1.0.23**. There is therefore
+no host that satisfies the floor but lacks the terminal API. The `runCatching { Throwable }` wrap
+is not the compatibility contract — it is there for the case that terminal-tab simply is not
+loaded, which now logs rather than degrading in silence.
+
 **`openTab` is fire-and-forget.** The host drops a tab silently if no factory is registered
 for its type, so `openServiceTabVerified` polls `activeTabs` and reports what actually
 happened instead of assuming success.
