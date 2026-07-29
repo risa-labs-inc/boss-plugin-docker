@@ -330,8 +330,13 @@ class DockerActions(private val services: DockerServices) {
         // and runImage's projectPath is itself nullable.
         val dir = workingDir?.takeIf { it.isNotBlank() }
             ?: services.context.projectPath?.takeIf { it.isNotBlank() }
+        // Counted *before* the send, not after: the consumer can receive, decrement and
+        // read `pending` in the window between a post-send increment and its own read, so
+        // the count would go transiently negative and the contention check would see 0
+        // while an item really was queued.
+        pending.incrementAndGet()
         val accepted = terminalCommands.trySend(TerminalCommand(id, title, command, dir)).isSuccess
-        if (accepted) pending.incrementAndGet()
+        if (!accepted) pending.decrementAndGet()
         return accepted
     }
 
@@ -391,16 +396,24 @@ class DockerActions(private val services: DockerServices) {
         val delivered = if (pending.get() > 0 && owned != null) {
             // Something is already queued behind this one, so delivering it to the shared
             // tab would type it and then interrupt it ~0 ms later: killed before it did
-            // anything, with its caller already told it was accepted. That is the bug this
-            // whole path fixes, relocated — deterministic for two Run clicks in a row, or
-            // a docker_build followed by a docker_compose_up.
+            // anything, with its caller already told it was accepted.
             //
-            // A sibling tab costs one tab *only under contention*, which by construction
-            // means two commands arrived inside a single delivery. Better than losing a
-            // compose-down. Skipping instead is not an option: a silently dropped
-            // destructive command is worse than a noisy one that starts.
-            log("Another command is queued; running this one in a bottom split rather than superseding it")
-            runInBottomSplit(api, owned, full)
+            // Note what this does *not* claim: `pending` is read once, at the start of
+            // this delivery, so it only catches a command enqueued before that read. Two
+            // Run clicks a second apart still interrupt-supersede, because the second
+            // arrives while the first is mid-delivery. Interrupt-supersedes is the common
+            // case; this is the narrow one where we can see the collision coming.
+            //
+            // A sibling terminal tab rather than a bottom split of this one, which is what
+            // the split API would otherwise make tidier: `createTab` takes an
+            // `initialCommand` that BossTerm holds until OSC 133;A (or a fallback delay)
+            // "so the shell is ready before bytes go down the PTY". The plugin API's
+            // `splitHorizontal` exposes no such parameter, so delivering into a split
+            // means writing to a pane whose shell may not have spawned — the write
+            // succeeds, the command vanishes, and nothing falls back. That is the same
+            // silent-loss shape as the reverted batching experiment. See boss-plugins#13.
+            log("Another command is queued; giving this one its own tab rather than superseding it")
+            createSideTab(api, tabs, full)
         } else if (owned != null) {
             deliverToOwnedTab(api, owned, full)
         } else {
@@ -570,40 +583,33 @@ class DockerActions(private val services: DockerServices) {
     }
 
     /**
-     * Run [full] in a **bottom split of the tab we already own**, leaving whatever is in
-     * the top pane alone.
+     * A tab of its own for a command that must not share one, left **unowned**.
      *
-     * Used under contention — see [deliver]. A split rather than another tab because the
-     * whole point of this path is to stay in one tab; the operator sees the two commands
-     * stacked instead of hunting a tab strip.
+     * Used under contention — see [deliver]. Not recorded as the owned tab, because the
+     * point is to leave whatever is running in the owned one alone; the next command
+     * still finds and reuses that tab.
      *
-     * No interrupt here, and that is the reason this exists: the new pane is a fresh
-     * shell, so there is nothing to interrupt and nothing gets superseded. Ownership is
-     * unchanged — the next command still reuses the top pane.
-     *
-     * `splitHorizontal` moves focus to the new pane (BossTerm's `preserveFocus` defaults
-     * to false, and the plugin API does not override it), which is what makes
-     * `writeToFocusedPane` land in the split rather than back in the busy pane. That
-     * ordering is load-bearing; the two calls must stay adjacent.
+     * No interrupt here, and that is the reason this exists: the new tab is a fresh
+     * shell, so there is nothing to interrupt and nothing gets superseded. `createTab`'s
+     * `initialCommand` is readiness-gated by BossTerm, so unlike a hand-written pane write
+     * the command cannot be typed before the shell exists.
      */
-    private fun runInBottomSplit(
+    private fun createSideTab(
         api: TerminalTabPluginAPI,
-        owned: CommandTerminal,
-        full: String,
+        tabs: List<ActiveTabData>,
+        command: String,
     ): Boolean {
-        val pane = runCatching {
-            api.splitHorizontal(owned.windowId, owned.hostTabId, owned.subTabId)
+        val host = findTerminalHost(api, tabs) ?: return false
+        val tabId = runCatching {
+            api.createTab(
+                windowId = host.windowId,
+                terminalId = host.tabId,
+                initialCommand = command,
+            )
         }.getOrNull() ?: return false
-        // Raw write, so the newline is ours to add — unlike sendCommand, which appends it.
-        val wrote = runCatching {
-            api.writeToFocusedPane(owned.windowId, owned.hostTabId, "$full\n", owned.subTabId)
-        }.getOrDefault(false)
-        if (wrote) {
-            focusHostTab(owned.hostTabId, owned.windowId)
-        } else {
-            log("Split pane $pane would not take the command")
-        }
-        return wrote
+        runCatching { api.switchToTab(host.windowId, host.tabId, tabId) }
+        focusHostTab(host.tabId, host.windowId)
+        return true
     }
 
     /**
