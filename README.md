@@ -47,15 +47,25 @@ Agents running in BOSS terminals get `mcp__boss__docker_*`:
 | `docker_compose_up` / `docker_compose_down` / `docker_compose_ls` | Compose projects |
 | `docker_open_service` | Open a container's service tab |
 
-**Every tool that changes Docker state requires the `docker.manage` permission**:
+**Every MCP tool that changes Docker state requires the `docker.manage` permission**:
 `docker_build`, `docker_start`, `docker_restart`, `docker_stop`, `docker_rm`,
 `docker_compose_up` and `docker_compose_down`. The read-only tools need nothing, and
 `docker_open_service` is deliberately ungated — it opens a BOSS tab and touches no Docker
 state.
 
-That split is not documentation to be trusted: `DockerMcpToolRbacTest` enumerates the real
-tool definitions and fails the build if a mutating tool ships without a permission, so this
-paragraph and the test cannot drift apart quietly.
+Two consequences worth knowing. **Admins bypass every permission check**, so on a
+single-user desktop the per-tool kill-switch in Toolbox is the control that actually bites.
+And **before you sign in there are no permissions at all**, so a signed-out session sees only
+the read-only tools plus `docker_open_service`; the gated seven appear on sign-in and
+disappear again on sign-out. That is a change from ≤ 1.0.3, where build/start/restart/compose
+up worked signed-out.
+
+`DockerMcpToolRbacTest` holds the list above to the code: it pins the complete tool surface,
+so a tool added, removed, hidden behind a host-provider check, or contributed by a second
+provider fails the build, as does one that mutates without a permission. What it cannot check
+is a tool a human deliberately files as read-only, or an exemption added on purpose — those
+are visible in the diff and reviewed there, not machine-verified. The test covers the MCP
+surface only; see below for the sidebar.
 
 ## Safety
 
@@ -66,14 +76,24 @@ paragraph and the test cannot drift apart quietly.
   the project's own file — the plugin does not rewrite it, so a service declaring
   `"8080:8080"` or `network_mode: host` binds exactly as declared. That is why compose up is
   permission-gated alongside the destructive tools.
-- Every removal asks for confirmation first.
+- **The sidebar is not permission-gated — only the MCP tools are.** Every button in the panel
+  (build & run, start, stop, restart, remove, compose up/down, remove image/volume/network)
+  runs without a permission check, so a signed-in user without `docker.manage` can still do
+  all of it by hand, including bringing up a compose stack that publishes on `0.0.0.0`. The
+  gate is about what an *agent* may do unattended. Action-level RBAC for panels needs host
+  support that does not exist yet (the only manifest-level gate is all-or-nothing and would
+  hide the read-only sidebar too).
+- Every removal **from the panel** asks for confirmation first. `docker_rm` over MCP does
+  not: it honours a `force` argument and never prompts — the permission is what stands in
+  its way.
 - No `docker system prune` or bulk destructive operations.
 - The plugin observes the daemon; it never starts containers on its own.
 
 ## Requirements
 
 - Docker Desktop, or the `docker` CLI with a reachable daemon
-- BOSS ≥ 9.2.35, boss-plugin-api ≥ 1.0.48
+- BOSS ≥ 9.2.35, boss-plugin-api ≥ 1.0.52 (`McpToolDefinition.withRbac`, which every gated
+  tool is built with, first exists in 1.0.52)
 
 ## Build
 

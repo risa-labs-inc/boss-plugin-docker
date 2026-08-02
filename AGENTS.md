@@ -11,7 +11,12 @@ serves, and inspect output.
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.docker`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.docker.DockerDynamicPlugin`
-- **API Version**: 1.0.48 (`minApiVersion` 1.0.48 — needs the MCP tool-provider API)
+- **API Version**: 1.0.52 (`minApiVersion` 1.0.52 — the MCP tool-provider API lands in 1.0.48,
+  but `McpToolDefinition.withRbac`, which every gated tool uses, needs the companion object
+  first shipped in **1.0.52**. `McpToolDefinition$Companion` is absent from the 1.0.48–1.0.51
+  jars; on such a host `tools()` throws `NoSuchFieldError`, which the host swallows by
+  registering the provider with an empty tool set plus a warn log — every `docker_*` tool
+  disappears while the panel keeps working. `DockerMcpToolRbacTest` pins this floor.)
 - **Type**: `mixed` (registers both a panel and a tab type)
 
 ## Essential Commands
@@ -73,8 +78,9 @@ not become reachable from the LAN because someone clicked Run, so `DockerActions
 `-p 127.0.0.1:$hostPort:$containerPort`. This guarantee does **not** extend to compose:
 `composeUp` runs `docker compose -f <file> up --build -d` on the project's own file
 unmodified, so ports declared there bind as declared. Rewriting a user's compose file would
-be worse; the mitigation is that compose up is permission-gated and the claim is stated
-accurately in the README rather than over-promised.
+be worse; the mitigation is that the `docker_compose_up` **MCP tool** is permission-gated (the
+panel's button is not — see "MCP Tools" below) and that the README states the loopback claim
+for the `docker run` path only instead of over-promising it.
 
 **Destructive actions always confirm.** The confirmation dialog is rendered by the panel
 itself rather than the host's `genericDialogProvider`, because that provider is nullable and
@@ -138,14 +144,57 @@ gated definition — `requiredPermissions` is a body property excluded from `equ
 that silently drops the gate.
 
 `docker_open_service` is `readOnly = false` but deliberately **not** gated: it opens a BOSS
-tab for a container that already exists, and shows logs the ungated `docker_logs` already
-returns.
+tab for a container that already exists and returns only "Opened the service tab" to the
+caller. Logs, preview and inspect render in the window for the human — inspect in particular
+(container `Env`, so possibly DB passwords) is fetched only when a person selects that
+section, so this is not an agent-readable path to secret material.
 
-`DockerMcpToolRbacTest` enforces both halves — it builds the provider and inspects the real
-definitions, so a mutating tool added without a permission (or a gate dropped by a `.copy()`)
-fails `./gradlew test`. Auditing this file **by text** instead needs care: definitions come
-from two factories, `McpToolDefinition(` and `McpToolDefinition.withRbac(`, and splitting on
-the former alone drops exactly the gated set and makes it look like nothing is gated.
+**Gating is MCP-only. The panel is not gated at all.** `DockerPanelViewModel` calls the same
+`DockerActions`/`DockerEngine` methods with no permission check, and the panel is registered
+unconditionally, so a user without `docker.manage` can still build, start, stop, restart,
+remove, and bring a compose stack up or down by clicking. That is deliberate for now: the
+threat model being addressed is an *agent* acting unattended, and there is no api affordance
+for action-level RBAC in a panel — `PluginManifest.requiredPermissions` is all-or-nothing and
+would hide the read-only sidebar too. Do not describe this plugin as permission-gated without
+saying "MCP tools"; a separate issue should cover the panel.
+
+**`requiredPermissions` is unsatisfiable before sign-in.** `McpToolRegistryImpl.permitted()`
+is `isAdmin || permissions.containsAll(required)`, and a signed-out session has neither, so
+the gated seven are absent until sign-in and vanish again on sign-out. Admins bypass the check
+entirely. Gating a tool therefore trades "works anonymously" for "requires a session" — worth
+weighing before adding a gate to a tool people use casually.
+
+### The guard test
+
+`DockerMcpToolRbacTest` pins the surface rather than spot-checking it:
+
+- providers are **discovered** by scanning compiled classes, so a second `McpToolProvider`
+  cannot contribute tools the test never sees;
+- `MUTATING` + `READ_ONLY` must equal the contributed tool set, so a new tool, a deleted one,
+  or one hidden behind a host-provider null-check fails — the surface is enumerated twice,
+  under an all-null and an all-non-null `PluginContext`, and the union is pinned;
+- each tool's declared `readOnly` flag must match its classification. This matters because
+  `readOnly` **defaults to `true`**: a destructive tool whose author forgot the line looks
+  read-only to the host and to any audit that trusts the flag.
+
+What it does not do: verify that a tool filed under `READ_ONLY` really is read-only, or stop a
+deliberate `UNGATED_BY_DESIGN` addition. Both are small diffs whose only gate is review; the
+lists exist so the diff has to say it out loud. A tool built conditionally on something that
+is not a `PluginContext` provider (env var, StateFlow value) is also still invisible.
+
+Auditing `DockerMcpTools.kt` **by text** instead needs care: definitions come from two
+factories, `McpToolDefinition(` and `McpToolDefinition.withRbac(`, and splitting on the former
+alone drops exactly the gated set and makes it look like nothing is gated.
+
+### `docker.manage` in the permission catalog
+
+`definedPermissions[].description` in `plugin.json` is only written **once**, the first time
+the permission is registered: the host's `register_plugin_permission` returns early when the
+name already exists and never updates the text. Editing it therefore changes what a *fresh*
+install records and nothing about an existing one — do not expect an edit here to reach
+anybody's Roles screen. Keep it accurate anyway, and scope it to what the permission actually
+gates (the MCP tools; the panel's image/volume/network removals are ungated, so claiming them
+would overstate it).
 
 ## Version Management
 
@@ -176,3 +225,18 @@ workflow's `./gradlew build` runs them too, but only after it has already bump-p
 version — too late to stop a bad merge, hence the separate PR job. It fetches the
 boss-plugin-api jar because the api is `compileOnly` (host-provided at runtime) and the tests
 run outside the host.
+
+Two honest limits on that job:
+
+- **It is advisory.** `main` has no branch protection and no rulesets, so a red *Tests* run
+  blocks nothing — it is a signal for the reviewer, not a gate. Making it binding means adding
+  it as a required status check on `main`.
+- **It resolves the api as `latest`**, matching what `build.yml` asks the release workflow for,
+  which is deliberately *not* the local pin (`1.0.66`) or the manifest floor (`1.0.52`). So the
+  guard is exercised against two api versions — the newest, in CI, and the pin, locally — and
+  neither run proves the floor itself compiles. Raising the floor is a manifest edit the test
+  checks; verifying it by building against that exact jar is not automated.
+
+The job also asserts the guard's own results file exists afterwards, because a `test` task with
+no test sources is `NO-SOURCE` and passes: deleting the test file would otherwise turn the
+guard off with a green build.
