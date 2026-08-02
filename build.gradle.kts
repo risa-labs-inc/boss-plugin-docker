@@ -36,9 +36,14 @@ dependencies {
     if (useLocalDependencies) {
         // Local development: pinned sibling JAR (symlinked next to the worktree).
         compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.66.jar"))
+        // compileOnly is invisible to the test compilation and test runtime, and
+        // the RBAC guard test reflects over real McpToolDefinition objects — so
+        // the same jar has to be on the test classpath too.
+        testImplementation(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.66.jar"))
     } else {
-        // CI: downloaded by the shared release workflow.
+        // CI: downloaded by the shared release workflow (and by test.yml).
         compileOnly(files("build/downloaded-deps/boss-plugin-api.jar"))
+        testImplementation(files("build/downloaded-deps/boss-plugin-api.jar"))
     }
 
     // Compose dependencies
@@ -63,6 +68,12 @@ dependencies {
 
     // Parsing `docker ... --format {{json .}}` output
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+
+    testImplementation(kotlin("test"))
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 // The default `jar` writes a classes-only archive into the same build/libs the

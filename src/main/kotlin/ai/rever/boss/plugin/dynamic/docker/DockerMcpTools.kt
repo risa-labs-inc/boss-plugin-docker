@@ -10,9 +10,18 @@ import java.io.File
  * `docker_*` tools for in-terminal agents. They surface as `mcp__boss__docker_*`
  * and appear/disappear with the plugin.
  *
- * Destructive tools are gated on the `docker.manage` permission the manifest
- * declares. Admins implicitly hold every permission, so a signed-in admin sees
- * them immediately; everyone else needs an explicit grant.
+ * **Every tool that changes Docker state is gated** on the `docker.manage`
+ * permission the manifest declares — build, start, restart, stop, rm, compose
+ * up and compose down alike. Gating only the teardown half (the state before
+ * boss-plugin-docker#3) left an agent able to build an image, bring a compose
+ * stack up and restart containers but unable to stop or remove them, which is an
+ * asymmetry rather than a policy. Admins implicitly hold every permission, so a
+ * signed-in admin sees them immediately; everyone else needs an explicit grant.
+ *
+ * The one `readOnly = false` tool deliberately left ungated is
+ * `docker_open_service`: it opens a BOSS tab and touches no Docker state. That
+ * exception is recorded — with its reason — in `DockerMcpToolRbacTest`, which
+ * fails the build if any other mutating tool ships without a permission.
  */
 class DockerMcpToolProvider(
     override val providerId: String,
@@ -100,7 +109,7 @@ class DockerMcpToolProvider(
             },
         ),
 
-        McpToolDefinition(
+        McpToolDefinition.withRbac(
             name = "docker_build",
             description = "Build a Dockerfile and run it, publishing a port on 127.0.0.1. " +
                 "Runs in the plugin's shared docker terminal tab, then starts the container " +
@@ -115,6 +124,7 @@ class DockerMcpToolProvider(
                 },"required":["dockerfile"]}
             """.trimIndent(),
             readOnly = false,
+            requiredPermissions = listOf(PERMISSION_MANAGE),
             handler = McpToolHandler { args ->
                 val path = args.string("dockerfile")
                     ?: return@McpToolHandler McpToolResult("Missing required argument: dockerfile", isError = true)
@@ -154,19 +164,21 @@ class DockerMcpToolProvider(
             },
         ),
 
-        McpToolDefinition(
+        McpToolDefinition.withRbac(
             name = "docker_start",
             description = "Start an existing stopped container.",
             inputSchema = containerArgSchema,
             readOnly = false,
+            requiredPermissions = listOf(PERMISSION_MANAGE),
             handler = McpToolHandler { args -> mutate(args) { engine.startContainer(it) } },
         ),
 
-        McpToolDefinition(
+        McpToolDefinition.withRbac(
             name = "docker_restart",
             description = "Restart a container.",
             inputSchema = containerArgSchema,
             readOnly = false,
+            requiredPermissions = listOf(PERMISSION_MANAGE),
             handler = McpToolHandler { args -> mutate(args) { engine.restartContainer(it) } },
         ),
 
@@ -197,17 +209,21 @@ class DockerMcpToolProvider(
             },
         ),
 
-        McpToolDefinition(
+        McpToolDefinition.withRbac(
             name = "docker_compose_up",
             description = "Bring a compose project up (detached, with --build) in the plugin's " +
-                "shared docker terminal tab. Another docker build or compose command interrupts " +
-                "it while it is still running; docker_compose_ls and the other read tools do not.",
+                "shared docker terminal tab. Runs the project's compose file as written, so any " +
+                "ports it publishes bind exactly as declared there — unlike docker_build, which " +
+                "pins published ports to 127.0.0.1. Another docker build or compose command " +
+                "interrupts it while it is still running; docker_compose_ls and the other read " +
+                "tools do not.",
             inputSchema = """
                 {"type":"object","properties":{
                   "file":{"type":"string","description":"Path to the compose file (absolute, or relative to the project)"}
                 },"required":["file"]}
             """.trimIndent(),
             readOnly = false,
+            requiredPermissions = listOf(PERMISSION_MANAGE),
             handler = McpToolHandler { args ->
                 val path = args.string("file")
                     ?: return@McpToolHandler McpToolResult("Missing required argument: file", isError = true)
@@ -270,6 +286,12 @@ class DockerMcpToolProvider(
             },
         ),
 
+        // Deliberately NOT gated on docker.manage — see DockerMcpToolRbacTest's
+        // allow-list. `readOnly = false` here means "has a side effect on the
+        // window", not "changes Docker": it opens a tab for a container that
+        // already exists and shows the same logs docker_logs already returns
+        // ungated. Gating it would only make the read-only surface inconsistent
+        // with itself.
         McpToolDefinition(
             name = "docker_open_service",
             description = "Open the BOSS service tab for a container — live logs, a preview of what it " +
