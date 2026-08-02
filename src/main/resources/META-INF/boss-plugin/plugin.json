@@ -3,8 +3,8 @@
   "pluginId": "ai.rever.boss.plugin.dynamic.docker",
   "displayName": "Docker",
   "version": "1.0.0",
-  "apiVersion": "1.0.48",
-  "minApiVersion": "1.0.48",
+  "apiVersion": "1.0.52",
+  "minApiVersion": "1.0.52",
   "minBossVersion": "9.2.35",
   "mainClass": "ai.rever.boss.plugin.dynamic.docker.DockerDynamicPlugin",
   "type": "mixed",
@@ -21,7 +21,7 @@
   "definedPermissions": [
     {
       "name": "docker.manage",
-      "description": "Change Docker state: build images, start, stop, restart and remove containers, bring compose projects up and down, and remove images, volumes and networks"
+      "description": "Let agents change Docker state: build images, start, stop, restart and remove containers, and bring compose projects up and down"
     }
   ],
   "sandbox": {

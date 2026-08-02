@@ -5,6 +5,10 @@ name: Tests
 # workflow, which does run `./gradlew build` (and therefore `test`) — but by then
 # the version has already been bumped and the release is under way. This job runs
 # the same tests on the pull request instead.
+#
+# ADVISORY ONLY: `main` currently has no branch protection and no rulesets, so a
+# red run here does not block a merge. To make it binding, add "test" as a
+# required status check on main.
 on:
   pull_request:
   push:
@@ -42,3 +46,16 @@ jobs:
         run: ./gradlew test --no-daemon
         env:
           CI: 'true'
+
+      # A `test` task with no test sources is NO-SOURCE and passes, so deleting the
+      # guard would silently turn it off with a green build. Require its results.
+      - name: Assert the RBAC guard actually ran
+        run: |
+          RESULTS='build/test-results/test/TEST-ai.rever.boss.plugin.dynamic.docker.DockerMcpToolRbacTest.xml'
+          if [ ! -f "$RESULTS" ]; then
+            echo "::error::DockerMcpToolRbacTest produced no results — the RBAC guard did not run."
+            exit 1
+          fi
+          grep -q 'tests="[1-9]' "$RESULTS" || {
+            echo "::error::DockerMcpToolRbacTest ran zero test cases."; exit 1; }
+          echo "RBAC guard ran:"; grep -o 'tests="[0-9]*"[^>]*failures="[0-9]*"' "$RESULTS" | head -1
