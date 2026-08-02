@@ -21,7 +21,7 @@
   "definedPermissions": [
     {
       "name": "docker.manage",
-      "description": "Stop and remove Docker containers, images, volumes and networks"
+      "description": "Change Docker state: build images, start, stop, restart and remove containers, bring compose projects up and down, and remove images, volumes and networks"
     }
   ],
   "sandbox": {

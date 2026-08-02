@@ -18,7 +18,8 @@ serves, and inspect output.
 
 ```bash
 ./gradlew buildPluginJar    # Build plugin JAR (output: build/libs/)
-./gradlew build             # Full build
+./gradlew build             # Full build (runs the tests too)
+./gradlew test              # RBAC guard over the MCP tool surface
 ```
 
 ## Workflow Rules
@@ -43,6 +44,8 @@ DockerServiceTab.kt       → tab type + TabInfo + section enum
 DockerServiceTabViewModel.kt → per-container state: log stream, inspect
 DockerServiceTabComponent.kt → tab UI: Logs | Preview | Inspect
 DockerMcpTools.kt         → `docker_*` MCP tools
+
+src/test/…/DockerMcpToolRbacTest.kt → guards the RBAC gate on the MCP surface
 ```
 
 ### Load-bearing decisions
@@ -65,8 +68,13 @@ terminal. A 30 s reconcile tick is a safety net only, for a silently dropped str
 **Daemon-down is a first-class state**, not an error path — `DaemonState` is
 `Unknown | CliMissing | Stopped | Starting | Running | Error`, each with its own UI.
 
-**Published ports bind `127.0.0.1` only.** A dev container should not become reachable from
-the LAN because someone clicked Run.
+**Published ports bind `127.0.0.1` only — on the `docker run` path.** A dev container should
+not become reachable from the LAN because someone clicked Run, so `DockerActions` pins
+`-p 127.0.0.1:$hostPort:$containerPort`. This guarantee does **not** extend to compose:
+`composeUp` runs `docker compose -f <file> up --build -d` on the project's own file
+unmodified, so ports declared there bind as declared. Rewriting a user's compose file would
+be worse; the mitigation is that compose up is permission-gated and the claim is stated
+accurately in the README rather than over-promised.
 
 **Destructive actions always confirm.** The confirmation dialog is rendered by the panel
 itself rather than the host's `genericDialogProvider`, because that provider is nullable and
@@ -123,9 +131,21 @@ happened instead of assuming success.
 `docker_start`, `docker_restart`, `docker_stop`, `docker_rm`, `docker_compose_up`,
 `docker_compose_down`, `docker_compose_ls`, `docker_open_service`.
 
-Destructive tools (`docker_stop`, `docker_rm`, `docker_compose_down`) are gated on the
-`docker.manage` permission via `McpToolDefinition.withRbac(...)`. Never `.copy()` a gated
-definition — that silently drops the gate.
+Every tool that changes Docker state is gated on the `docker.manage` permission via
+`McpToolDefinition.withRbac(...)`: `docker_build`, `docker_start`, `docker_restart`,
+`docker_stop`, `docker_rm`, `docker_compose_up`, `docker_compose_down`. Never `.copy()` a
+gated definition — `requiredPermissions` is a body property excluded from `equals`/`copy`, so
+that silently drops the gate.
+
+`docker_open_service` is `readOnly = false` but deliberately **not** gated: it opens a BOSS
+tab for a container that already exists, and shows logs the ungated `docker_logs` already
+returns.
+
+`DockerMcpToolRbacTest` enforces both halves — it builds the provider and inspects the real
+definitions, so a mutating tool added without a permission (or a gate dropped by a `.copy()`)
+fails `./gradlew test`. Auditing this file **by text** instead needs care: definitions come
+from two factories, `McpToolDefinition(` and `McpToolDefinition.withRbac(`, and splitting on
+the former alone drops exactly the gated set and makes it look like nothing is gated.
 
 ## Version Management
 
@@ -150,3 +170,9 @@ Pushes to `main` trigger the release workflow which builds the JAR, creates a Gi
 and publishes to the BOSS Plugin Store. Defined in `.github/workflows/build.yml`, delegating
 to the shared workflow in `risa-labs-inc/BossConsole-Releases`. Requires the
 `BOSS_STORE_PLUGIN_PUBLISH_KEY` repo secret.
+
+`.github/workflows/test.yml` runs `./gradlew test` on every pull request. The release
+workflow's `./gradlew build` runs them too, but only after it has already bump-pushed the
+version — too late to stop a bad merge, hence the separate PR job. It fetches the
+boss-plugin-api jar because the api is `compileOnly` (host-provided at runtime) and the tests
+run outside the host.

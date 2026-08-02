@@ -47,12 +47,25 @@ Agents running in BOSS terminals get `mcp__boss__docker_*`:
 | `docker_compose_up` / `docker_compose_down` / `docker_compose_ls` | Compose projects |
 | `docker_open_service` | Open a container's service tab |
 
-`docker_stop`, `docker_rm` and `docker_compose_down` require the `docker.manage` permission.
+**Every tool that changes Docker state requires the `docker.manage` permission**:
+`docker_build`, `docker_start`, `docker_restart`, `docker_stop`, `docker_rm`,
+`docker_compose_up` and `docker_compose_down`. The read-only tools need nothing, and
+`docker_open_service` is deliberately ungated — it opens a BOSS tab and touches no Docker
+state.
+
+That split is not documentation to be trusted: `DockerMcpToolRbacTest` enumerates the real
+tool definitions and fails the build if a mutating tool ships without a permission, so this
+paragraph and the test cannot drift apart quietly.
 
 ## Safety
 
-- Published ports bind **127.0.0.1 only** — running a container here never exposes it to your
-  network.
+- **The Dockerfile path publishes on `127.0.0.1` only.** `docker_build` and the panel's
+  *Build & run* pin published ports to loopback, so a container BOSS starts that way is not
+  reachable from your network.
+- **Compose files run as written.** `docker_compose_up` is `docker compose up --build -d` on
+  the project's own file — the plugin does not rewrite it, so a service declaring
+  `"8080:8080"` or `network_mode: host` binds exactly as declared. That is why compose up is
+  permission-gated alongside the destructive tools.
 - Every removal asks for confirmation first.
 - No `docker system prune` or bulk destructive operations.
 - The plugin observes the daemon; it never starts containers on its own.
