@@ -105,8 +105,8 @@ notification afterwards. There is no liveness signal to gate an after-the-fact t
 
 **`openTerminal` returning true means "accepted for delivery", not "running".** The command is
 queued; the consumer types it later. So `buildAndRun` registers `pendingAutoOpen` and the panel
-toasts before anything has been typed, and a command can still fall back to a BOSS tab - or fail
-— after its caller was told it launched. The MCP tools hedge their wording for this; the panel
+toasts before anything has been typed, and a command can still fall back to a BOSS tab - or fail -
+after its caller was told it launched. The MCP tools hedge their wording for this; the panel
 toasts do not, because a click has visible consequences the operator is already watching.
 
 **No API-version floor was raised for the terminal reuse.** Everything it uses predates the
