@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.docker
 
+import ai.rever.boss.plugin.ui.BossAlertDialog
 import ai.rever.boss.plugin.api.PanelComponentWithUI
 import ai.rever.boss.plugin.api.PanelInfo
 import ai.rever.boss.plugin.ui.BossSearchBar
@@ -551,7 +552,7 @@ private fun RowShell(
 
 @Composable
 private fun RunDialog(viewModel: DockerPanelViewModel, request: RunRequest) {
-    AlertDialog(
+    BossAlertDialog(
         onDismissRequest = viewModel::cancelRun,
         backgroundColor = BossThemeColors.SurfaceColor,
         title = {
@@ -629,7 +630,7 @@ private fun PortField(label: String, value: String, onChange: (String) -> Unit) 
 
 @Composable
 private fun ConfirmDialog(viewModel: DockerPanelViewModel, request: ConfirmRequest) {
-    AlertDialog(
+    BossAlertDialog(
         onDismissRequest = viewModel::dismissConfirm,
         backgroundColor = BossThemeColors.SurfaceColor,
         title = { Text(request.title, color = BossThemeColors.TextPrimary, fontSize = 14.sp) },
