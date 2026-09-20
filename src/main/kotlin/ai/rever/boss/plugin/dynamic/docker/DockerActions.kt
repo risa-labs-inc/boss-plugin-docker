@@ -10,7 +10,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 import java.net.ServerSocket
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 /** Where a launched terminal tab should be placed. */
@@ -44,6 +43,11 @@ private data class TerminalCommand(
     val title: String,
     val command: String,
     val workingDir: String?,
+    /**
+     * The container name this command would create, if it reserved one. Carried so that a
+     * command superseded in the shared tab can give its reservation back (#2).
+     */
+    val reservedName: String? = null,
 )
 
 /**
@@ -69,7 +73,13 @@ class DockerActions(private val services: DockerServices) {
      * ConcurrentModificationException waiting for the right timing — pre-existing, but
      * this change is explicitly about getting this file's threading right.
      */
-    private val pendingAutoOpen = ConcurrentHashMap<String, Long>()
+    private val pendingAutoOpen = AutoOpenReservations(AUTO_OPEN_WINDOW_MS)
+
+    /**
+     * The reservation of whatever is running in our own terminal tab, so the next command
+     * delivered there - which interrupts it - can release it.
+     */
+    private var tabOccupant: String? = null
 
     /**
      * The terminal tab this plugin owns.
@@ -174,19 +184,24 @@ class DockerActions(private val services: DockerServices) {
             "echo \"Serving on http://localhost:$hostPort\"",
         ).joinToString(" && ")
 
+        // Reserved before the command is queued, not after it is accepted: delivery is
+        // asynchronous, so a reservation made afterwards could be released by its own
+        // supersession before it existed.
+        if (services.autoOpenServiceTab.value) pendingAutoOpen.reserve(name)
         val launched = openTerminal(
             id = "docker-build-$name-${System.currentTimeMillis()}",
             title = "Build: ${artifact.suggestedName}",
             command = command,
             workingDir = contextDir.absolutePath,
             location = location,
+            reservedName = name,
         )
-        if (!launched) return null
+        if (!launched) {
+            pendingAutoOpen.release(name)
+            return null
+        }
 
         rememberPort(artifact, hostPort)
-        if (services.autoOpenServiceTab.value) {
-            pendingAutoOpen[name] = System.currentTimeMillis() + AUTO_OPEN_WINDOW_MS
-        }
         return name
     }
 
@@ -208,16 +223,18 @@ class DockerActions(private val services: DockerServices) {
             append("docker run -d --name ${q(name)}$publish ${q(image.reference)}")
             if (hostPort != null) append(" && echo \"Serving on http://localhost:$hostPort\"")
         }
+        if (services.autoOpenServiceTab.value) pendingAutoOpen.reserve(name)
         val launched = openTerminal(
             id = "docker-run-$name-${System.currentTimeMillis()}",
             title = "Run: $base",
             command = command,
             workingDir = services.context.projectPath,
             location = location,
+            reservedName = name,
         )
-        if (!launched) return null
-        if (services.autoOpenServiceTab.value) {
-            pendingAutoOpen[name] = System.currentTimeMillis() + AUTO_OPEN_WINDOW_MS
+        if (!launched) {
+            pendingAutoOpen.release(name)
+            return null
         }
         return name
     }
@@ -275,8 +292,9 @@ class DockerActions(private val services: DockerServices) {
         command: String,
         workingDir: String?,
         location: OpenLocation = OpenLocation.NEW_TAB,
+        reservedName: String? = null,
     ): Boolean {
-        if (location == OpenLocation.NEW_TAB && runInExistingTerminal(id, title, command, workingDir)) {
+        if (location == OpenLocation.NEW_TAB && runInExistingTerminal(id, title, command, workingDir, reservedName)) {
             return true
         }
 
@@ -322,6 +340,7 @@ class DockerActions(private val services: DockerServices) {
         title: String,
         command: String,
         workingDir: String?,
+        reservedName: String? = null,
     ): Boolean {
         check(started) { "DockerActions.start() was never called; commands would queue and never be delivered" }
         // Never leave the directory implicit. On reuse the tab sits wherever the last
@@ -335,7 +354,7 @@ class DockerActions(private val services: DockerServices) {
         // the count would go transiently negative and the contention check would see 0
         // while an item really was queued.
         pending.incrementAndGet()
-        val accepted = terminalCommands.trySend(TerminalCommand(id, title, command, dir)).isSuccess
+        val accepted = terminalCommands.trySend(TerminalCommand(id, title, command, dir, reservedName)).isSuccess
         if (!accepted) pending.decrementAndGet()
         return accepted
     }
@@ -393,6 +412,10 @@ class DockerActions(private val services: DockerServices) {
         val full = if (queued.workingDir == null) queued.command else "cd ${q(queued.workingDir)} && ${queued.command}"
         val owned = liveOwnedTerminal(api, tabs)
         val hadOwnTab = owned != null
+        // Whether this command ends up running in the tab we own - the only one a later
+        // command supersedes. A side tab and the BOSS-tab fallback each get a terminal of
+        // their own, where nothing interrupts them.
+        var occupiesOurTab = false
         val delivered = if (pending.get() > 0 && owned != null) {
             // Something is already queued behind this one, so delivering it to the shared
             // tab would type it and then interrupt it ~0 ms later: killed before it did
@@ -415,6 +438,12 @@ class DockerActions(private val services: DockerServices) {
             log("Another command is queued; giving this one its own tab rather than superseding it")
             createSideTab(api, tabs, full)
         } else if (owned != null) {
+            // This types over whatever our tab is running, after two Ctrl-Cs. Whatever that
+            // command was going to create is not coming, so its reservation goes back rather
+            // than holding the name for the rest of the window (#2).
+            tabOccupant?.let { pendingAutoOpen.release(it) }
+            tabOccupant = null
+            occupiesOurTab = true
             deliverToOwnedTab(api, owned, full)
         } else {
             // `full`, not the bare command: both paths then derive the directory the same
@@ -422,8 +451,10 @@ class DockerActions(private val services: DockerServices) {
             // it is ever not honoured for the initial command, the *first* command runs in
             // the wrong place and every later one is right — a miserable thing to debug.
             // A redundant cd costs nothing.
+            occupiesOurTab = true
             createOwnedTab(api, tabs, full)
         }
+        if (delivered && occupiesOurTab) tabOccupant = queued.reservedName
         if (!delivered) {
             // Two different failures, and conflating them is what you would be debugging
             // from: no tabbed terminal open anywhere, versus our own tab refusing a write.
@@ -434,6 +465,7 @@ class DockerActions(private val services: DockerServices) {
                 // opening a BOSS tab anyway — on a loop, in silence.
                 log("Our terminal tab refused the command; dropping it")
                 ownedTerminal = null
+                tabOccupant = null
             } else {
                 log("No tabbed terminal to join; opening a BOSS tab")
             }
@@ -652,14 +684,13 @@ class DockerActions(private val services: DockerServices) {
      * we launched, once it actually exists.
      */
     fun onContainersChanged(containers: List<ContainerInfo>) {
-        if (pendingAutoOpen.isEmpty()) return
-        val now = System.currentTimeMillis()
-        pendingAutoOpen.entries.removeAll { it.value < now } // expired launches
-        if (pendingAutoOpen.isEmpty()) return
+        if (pendingAutoOpen.isEmpty) return
+        pendingAutoOpen.pruneExpired()
+        if (pendingAutoOpen.isEmpty) return
 
         for (container in containers) {
             if (!container.isRunning) continue
-            if (pendingAutoOpen.remove(container.name) == null) continue
+            if (!pendingAutoOpen.claim(container.name)) continue
             services.openServiceTab(container)
         }
     }
@@ -671,14 +702,8 @@ class DockerActions(private val services: DockerServices) {
      * a collision, and silently `rm -f`ing the old one would destroy state the
      * user may still want.
      */
-    fun uniqueContainerName(base: String): String {
-        val cleaned = base.lowercase().replace(Regex("[^a-z0-9_.-]+"), "-").trim('-').ifBlank { "app" }
-        val taken = services.engine.containers.value.map { it.name }.toSet() + pendingAutoOpen.keys
-        if (cleaned !in taken) return cleaned
-        var n = 2
-        while ("$cleaned-$n" in taken) n++
-        return "$cleaned-$n"
-    }
+    fun uniqueContainerName(base: String): String =
+        nextFreeName(base, services.engine.containers.value.map { it.name }.toSet() + pendingAutoOpen.names())
 
     /** Last host port used for this artifact, else a free one. */
     suspend fun suggestedHostPort(artifact: ProjectArtifact): Int {
